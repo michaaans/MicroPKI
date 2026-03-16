@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "MicroPKI"
+version = "0.0.1"
+description = "MicroPKI — учебный УЦ"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "michaaans" }
+]
+keywords = [
+    "cryptography",
+    "educational",
+]
+
+dependencies = [
+    "cryptography>=46.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+]
+
+[project.urls]
+Repository = "https://github.com/michaaans/MicroPKI"
+
+[project.scripts]
+micropki = "micropki.ca:main"
+
+[tool.setuptools.packages.find]
+exclude = ["tests", "tests.*"]
