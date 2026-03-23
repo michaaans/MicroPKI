@@ -6,7 +6,8 @@
 
 - Python 3.10+
 - OpenSSL
-- `cryptography` >= 46.0.0
+- cryptography >= 46.0.0
+- pytest >= 7.0
 
 ## Установка
 
@@ -23,6 +24,21 @@ source venv/bin/activate
 
 # Установите проект в режиме разработки
 pip install -e .
+
+# или
+
+# Установите проект в режиме разработки ВМЕСТЕ С pytest
+pip install -e ".[test]"
+```
+
+```bash
+# Запуск модульных тестов
+
+pytest
+
+# или
+
+pytest tests/ -v
 ```
 
 ## Использование
@@ -47,6 +63,60 @@ micropki ca init \
     --passphrase-file secrets/ca.pass \
     --out-dir pki
 ```
+
+Создание промежуточного CA
+```bash
+micropki ca issue-intermediate \
+    --root-cert pki/certs/ca.cert.pem \
+    --root-key pki/private/ca.key.pem \
+    --root-pass-file secrets/root.pass \
+    --subject "CN=MicroPKI Intermediate CA,O=MicroPKI" \
+    --key-type rsa \
+    --key-size 4096 \
+    --passphrase-file secrets/intermediate.pass \
+    --out-dir pki \
+    --validity-days 1825 \
+    --pathlen 0
+```
+
+Выпуск серверного сертификата
+```bash
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=example.com,O=MicroPKI" \
+    --san dns:example.com \
+    --san dns:www.example.com \
+    --san ip:192.168.1.10 \
+    --out-dir pki/certs \
+    --validity-days 365
+```
+
+Выпуск клиентского сертификата
+```bash
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template client \
+    --subject "CN=Alice Smith" \
+    --san email:alice@example.com \
+    --out-dir pki/certs
+```
+
+Шаг 7. Выпуск сертификата подписи кода
+```bash
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template code_signing \
+    --subject "CN=MicroPKI Code Signer" \
+    --out-dir pki/certs
+```
+
 
 ## Тестирование
 ### TEST-1
@@ -149,13 +219,341 @@ micropki ca init --subject "invalid-dn" --passphrase-file secrets/ca.pass
 # Ожидаемый результат: Ошибка: Некорректный DN component: 'invalid-dn'. Ожидается KEY=VALUE
 ```
 
+### TEST-5
+```bash
+# Модульные тесты
+pytest
+
+```
+
+### TEST-7
+```bash
+# Проверка: промежуточный CA подписан корневым CA
+openssl verify -CAfile pki/certs/ca.cert.pem pki/certs/intermediate.cert.pem
+
+# Ожидаемый результат: pki/certs/intermediate.cert.pem: OK
+```
+
+### TEST-7A
+```bash
+# Проверка: конечный сертификат подписан промежуточным CA,
+# а промежуточный — корневым (полная цепочка)
+openssl verify \
+    -CAfile pki/certs/ca.cert.pem \
+    -untrusted pki/certs/intermediate.cert.pem \
+    pki/certs/example.com.cert.pem
+    
+# Ожидаемый результат: pki/certs/example.com.cert.pem: OK
+```
+
+### TEST-7B
+```bash
+# Корневой CA — даты действия
+openssl x509 -in pki/certs/ca.cert.pem -noout -dates
+
+# Ожидаемый результат: notBefore=Mar 23 12:04:04 2026 GMT
+#                      notAfter=Mar 18 12:04:04 2046 GMT
+```
+
+### TEST-7C
+```bash
+# Промежуточный CA — даты действия
+openssl x509 -in pki/certs/intermediate.cert.pem -noout -dates
+
+# Ожидаемый результат: notBefore=Mar 23 12:06:59 2026 GMT
+#                      notAfter=Mar 22 12:06:59 2031 GMT
+```
+
+### TEST-7D
+```bash
+# Конечный сертификат — даты действия
+openssl x509 -in pki/certs/example.com.cert.pem -noout -dates
+
+# Ожидаемый результат: notBefore=Mar 23 12:08:06 2026 GMT
+#                      notAfter=Mar 23 12:08:06 2027 GMT
+```
+
+### TEST-7E
+```bash
+# Корневой CA: должен быть CA:TRUE
+openssl x509 -in pki/certs/ca.cert.pem -noout -text | grep -A1 "Basic Constraints"
+
+# Ожидаемый результат:    X509v3 Basic Constraints: critical
+#                             CA:TRUE  
+```
+
+### TEST-7F
+```bash
+# Промежуточный CA: CA:TRUE, pathlen:0
+openssl x509 -in pki/certs/intermediate.cert.pem -noout -text | grep -A1 "Basic Constraints"
+
+# Ожидаемый результат:    X509v3 Basic Constraints: critical
+#                             CA:TRUE, pathlen:0
+```
+
+### TEST-7G
+```bash
+# Конечный сертификат: CA:FALSE
+openssl x509 -in pki/certs/example.com.cert.pem -noout -text | grep -A1 "Basic Constraints"
+
+# Ожидаемый результат:    X509v3 Basic Constraints: critical
+#                             CA:FALSE
+```
+
+### TEST-8
+```bash
+# Расширения корневого CA
+openssl x509 -in pki/certs/ca.cert.pem -text -noout
+
+# Ожидаемый результат: Version: 3 (0x2)
+# Issuer = Subject (самоподписанный)
+# X509v3 Basic Constraints: critical
+#       CA:TRUE
+# X509v3 Key Usage: critical
+#       Digital Signature, Certificate Sign, CRL Sign
+# X509v3 Subject Key Identifier: <хеш>
+# X509v3 Authority Key Identifier: <совпадает с SKI>
+```
+
+### TEST-8A
+```bash
+# Расширения промежуточного CA
+openssl x509 -in pki/certs/intermediate.cert.pem -text -noout
+
+# Ожидаемый результат: Version: 3 (0x2)
+# Issuer: CN = Demo Root CA (отличается от Subject)
+# Subject: CN = MicroPKI Intermediate CA
+# X509v3 Basic Constraints: critical
+#       CA:TRUE, pathlen:0
+# X509v3 Key Usage: critical
+#       Digital Signature, Certificate Sign, CRL Sign
+# X509v3 Subject Key Identifier: <хеш>
+# X509v3 Authority Key Identifier: <хеш корневого CA>
+```
+
+### TEST-8B
+```bash
+# Расширения серверного сертификата (с SAN)
+openssl x509 -in pki/certs/example.com.cert.pem -text -noout
+
+# Ожидаемый результат: Version: 3 (0x2)
+# Issuer: CN = MicroPKI Intermediate CA
+# X509v3 Basic Constraints: critical
+#       CA:FALSE
+# X509v3 Key Usage: critical
+#       Digital Signature, Key Encipherment
+# X509v3 Extended Key Usage:
+#       TLS Web Server Authentication
+# X509v3 Subject Alternative Name:
+#       DNS:example.com, DNS:www.example.com, IP Address:192.168.1.10
+# X509v3 Subject Key Identifier: <хеш>
+# X509v3 Authority Key Identifier: <хеш промежуточного CA>
+```
+
+### TEST-8C
+```bash
+# Расширения клиентского сертификата
+openssl x509 -in pki/certs/Alice_Smith.cert.pem -text -noout
+
+# Ожидаемый результат: X509v3 Basic Constraints: critical
+#       CA:FALSE
+# X509v3 Key Usage: critical
+#       Digital Signature
+# X509v3 Extended Key Usage:
+#       TLS Web Client Authentication
+# X509v3 Subject Alternative Name:
+#       email:alice@example.com
+```
+
+### TEST-8D
+```bash
+# Расширения сертификата подписи кода
+openssl x509 -in pki/certs/MicroPKI_Code_Signer.cert.pem -text -noout
+
+# Ожидаемый результат: X509v3 Basic Constraints: critical
+#       CA:FALSE
+# X509v3 Key Usage: critical
+#       Digital Signature
+# X509v3 Extended Key Usage:
+#       Code Signing
+```
+
+### TEST-9
+```bash
+# Создаём файл с полной цепочкой (intermediate + root)
+# для использования сервером
+cat pki/certs/intermediate.cert.pem pki/certs/ca.cert.pem > pki/certs/chain.pem
+
+# Терминал 1 — запуск TLS-сервера:
+openssl s_server \
+    -cert pki/certs/example.com.cert.pem \
+    -key pki/certs/example.com.key.pem \
+    -CAfile pki/certs/ca.cert.pem \
+    -chainCAfile pki/certs/chain.pem \
+    -accept 4443 \
+    -www
+    
+# Using default temp DH parameters
+# ACCEPT
+
+# Терминал 2 — подключение TLS-клиента:
+
+openssl s_client \
+    -connect localhost:4443 \
+    -CAfile pki/certs/ca.cert.pem \
+    -verify 3 \
+    -verify_return_error
+
+# Ожидаемый вывод (основное): 
+# depth=2 CN = Demo Root CA, O = MicroPKI, C = RU
+# verify return:1
+# depth=1 CN = MicroPKI Intermediate CA, O = MicroPKI
+# verify return:1
+# depth=0 CN = example.com, O = MicroPKI
+# verify return:1
+# ---
+# SSL handshake has read 4500 bytes and written 373 bytes
+# Verification: OK
+# ---
+```
+
+### TEST-10
+```bash
+# Серверный сертификат без SAN
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=no-san.example.com" \
+    --out-dir pki/certs
+
+# Ожидаемый результат: Ошибка: Шаблон 'server' требует хотя бы одну запись SAN.
+```
+
+### TEST-10A
+```bash
+# Неподдерживаемый тип SAN для шаблона
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=test.com" \
+    --san email:user@test.com \
+    --out-dir pki/certs
+
+# Ожидаемый результат: Ошибка: Тип SAN 'email' не допускается для шаблона 'server'. Допустимые: ['dns', 'ip']
+```
+
+### TEST-10B
+```bash
+# Неверная парольная фраза
+echo -n "wrong_password" > secrets/wrong.pass
+
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/wrong.pass \
+    --template server \
+    --subject "CN=test.com" \
+    --san dns:test.com \
+    --out-dir pki/certs
+
+# Ожидаемый результат: Ошибка: Incorrect password, could not decrypt key
+```
+
+### TEST-10C
+```bash
+# IP SAN для шаблона подписи кода
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template code_signing \
+    --subject "CN=Code Signer" \
+    --san ip:1.2.3.4 \
+    --out-dir pki/certs
+
+# Ожидаемый результат: Ошибка: Тип SAN 'ip' не допускается для шаблона 'code_signing'. Допустимые: ['dns', 'uri']
+```
+
+### TEST-11
+```bash
+# Проверка промежуточного CA
+openssl verify -CAfile pki/certs/ca.cert.pem pki/certs/intermediate.cert.pem
+
+# Ожидаемый результат: pki/certs/intermediate.cert.pem: OK
+```
+
+### TEST-11A
+```bash
+# Проверка конечного сертификата с полной цепочкой
+openssl verify \
+    -CAfile pki/certs/ca.cert.pem \
+    -untrusted pki/certs/intermediate.cert.pem \
+    pki/certs/example.com.cert.pem
+
+# Ожидаемый результат: pki/certs/example.com.cert.pem: OK
+```
+
+### TEST-11B
+```bash
+# Проверка клиентского сертификата
+openssl verify \
+    -CAfile pki/certs/ca.cert.pem \
+    -untrusted pki/certs/intermediate.cert.pem \
+    pki/certs/Alice_Smith.cert.pem
+
+# Ожидаемый результат: pki/certs/Alice_Smith.cert.pem: OK
+```
+
+### TEST-11C
+```bash
+# Проверка сертификата подписи кода
+openssl verify \
+    -CAfile pki/certs/ca.cert.pem \
+    -untrusted pki/certs/intermediate.cert.pem \
+    pki/certs/MicroPKI_Code_Signer.cert.pem
+
+# Ожидаемый результат: pki/certs/MicroPKI_Code_Signer.cert.pem: OK
+```
+
+### TEST-12
+```bash
+# Модульные тесты
+pytest
+
+# Ожидаемый результат:
+========================================= test session starts ==========================================
+configfile: pyproject.toml
+collected 31 items
+
+tests/test_csr.py ...                                                                                    [  9%]
+tests/test_negative.py ....                                                                              [ 22%]
+tests/test_san.py ...........                                                                            [ 58%]
+tests/test_templates.py .............                                                                    [100%]
+
+========================================== 31 passed in 2.27s ==========================================
+```
+
 ## Структура выходных файлов
 ```text
 pki/
 ├── private/
-│   └── ca.key.pem        # зашифрованный закрытый ключ (PKCS#8)
+│   ├── intermediate.key.pem # зашифрованный ключ промежуточного CA
+│   └── ca.key.pem           # зашифрованный закрытый ключ (PKCS#8)
 ├── certs/
-│   └── ca.cert.pem       # самоподписанный сертификат X.509 v3
+│   ├── ca.cert.pem                  # сертификат корневого CA
+│   ├── intermediate.cert.pem        # сертификат промежуточного CA
+│   ├── example.com.cert.pem         # серверный сертификат
+│   ├── example.com.key.pem          # незашифрованный ключ сервера
+│   ├── Alice_Smith.cert.pem         # клиентский сертификат
+│   ├── Alice_Smith.key.pem          # незашифрованный ключ клиента
+│   ├── MicroPKI_Code_Signer.cert.pem
+│   └── MicroPKI_Code_Signer.key.pem
+├── csrs/
+│   └── intermediate.csr.pem         # CSR промежуточного CA
 └── policy.txt            # документ политики УЦ
 ```
 
@@ -168,8 +566,15 @@ MicroPKI/
 │   ├── ca.py                 # логика CA
 │   ├── certificates.py       # X.509
 │   ├── crypto_utils.py       # генерация ключей, PEM, шифрование
+│   ├── chain.py              # модуль проверки цепочки сертификатов
+│   ├── csr.py                # работа с запросами на сертификат
+│   ├── templates.py          # шаблоны сертификатов
 │   └── logger.py             # настройка логирования
 ├── tests/
+│   ├── test_csr.py           
+│   ├── test_negative.py               
+│   ├── test_san.py                
+│   └── test_templates.py
 ├── .gitignore
 ├── pyproject.toml
 └── README.md

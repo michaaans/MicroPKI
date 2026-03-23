@@ -22,3 +22,5 @@ logs/
 # IDE
 .idea/
 
+# Pytest cache
+.pytest_cache/
