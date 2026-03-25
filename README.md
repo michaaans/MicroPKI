@@ -42,8 +42,23 @@ pytest tests/ -v
 ```
 
 ## Использование
-Инициализация корневого CA (RSA-4096)
 
+Создание парольных фраз
+```bash
+# Инициализация парольной фразы для корневого УЦ
+echo -n "MySecure_Passphrase_RootCA" > secrets/ca.pass
+
+# Инициализация парольной фразы для промежуточного УЦ
+echo -n "MySecure_Passphrase_IntermediateCA" > secrets/intermediate.pass
+```
+
+Инициализация БД
+```bash
+micropki db init --db-path ./pki/micropki.db
+# Вывод: База данных инициализирована: pki\micropki.db
+```
+
+Инициализация корневого CA (RSA-4096)
 ```bash
 micropki ca init \
     --subject "/CN=Demo Root CA/O=MicroPKI/C=RU" \
@@ -92,6 +107,17 @@ micropki ca issue-cert \
     --san ip:192.168.1.10 \
     --out-dir pki/certs \
     --validity-days 365
+    
+# или с записью в БД
+
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=example.com, O=MicroPKI" \
+    --san dns:example.com --san dns:www.example.com --san ip:192.168.1.10 \
+    --db-path pki/micropki.db
 ```
 
 Выпуск клиентского сертификата
@@ -104,9 +130,20 @@ micropki ca issue-cert \
     --subject "CN=Alice Smith" \
     --san email:alice@example.com \
     --out-dir pki/certs
+    
+# или с записью в БД
+
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template client \
+    --subject "CN=Alice Smith" \
+    --san email:alice@example.com \
+    --db-path pki/micropki.db
 ```
 
-Шаг 7. Выпуск сертификата подписи кода
+Выпуск сертификата подписи кода
 ```bash
 micropki ca issue-cert \
     --ca-cert pki/certs/intermediate.cert.pem \
@@ -115,8 +152,59 @@ micropki ca issue-cert \
     --template code_signing \
     --subject "CN=MicroPKI Code Signer" \
     --out-dir pki/certs
+    
+# или с записью в БД
+
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template code_signing \
+    --subject "CN=MicroPKI Code Signer" \
+    --db-path pki/micropki.db
 ```
 
+Просмотр сертификатов
+```bash
+# Список всех
+micropki ca list-certs
+
+# Только действительные
+micropki ca list-certs --status valid
+
+# В формате (table/json/csv)
+micropki ca list-certs --format json
+
+# Конкретный сертификат
+micropki ca show-cert 69C41A28D533E208
+```
+
+HTTP-сервер
+```bash
+# Запуск
+micropki repo serve
+
+# или 
+
+micropki repo serve --host 127.0.0.1 --port 8080
+
+# В другом терминале:
+
+# Получить корневой CA
+curl http://localhost:8080/ca/root
+
+# Получить промежуточный CA
+curl http://localhost:8080/ca/intermediate
+
+# Получить сертификат по серийному номеру
+curl http://localhost:8080/certificate/69C41A28D533E208
+
+# CRL (заглушка)
+curl http://localhost:8080/crl
+
+# Некорректный серийный номер
+curl http://localhost:8080/certificate/XYZ
+```
 
 ## Тестирование
 ### TEST-1
@@ -537,6 +625,165 @@ tests/test_templates.py .............                                           
 ========================================== 31 passed in 2.27s ==========================================
 ```
 
+### TEST-13
+```bash
+# Сертификат 1: серверный
+micropki ca issue-cert --ca-cert pki/certs/intermediate.cert.pem --ca-key pki/private/intermediate.key.pem --ca-pass-file secrets/intermediate.pass --template server --subject "cn=server1.example.com" --san dns:server1.example.com --db-path pki/micropki.db
+
+# Сертификат 2: серверный с несколькими SAN
+micropki ca issue-cert --ca-cert pki/certs/intermediate.cert.pem --ca-key pki/private/intermediate.key.pem --ca-pass-file secrets/intermediate.pass --template server --subject "cn=server2.example.com" --san dns:server2.example.com --san dns:www.server2.example.com --san ip:10.0.0.2 --db-path pki/micropki.db
+
+# Сертификат 3: клиентский
+micropki ca issue-cert --ca-cert pki/certs/intermediate.cert.pem --ca-key pki/private/intermediate.key.pem --ca-pass-file secrets/intermediate.pass --template client --subject "cn=alice" --san email:alice@example.com --db-path pki/micropki.db
+
+# Сертификат 4: клиентский
+micropki ca issue-cert --ca-cert pki/certs/intermediate.cert.pem --ca-key pki/private/intermediate.key.pem --ca-pass-file secrets/intermediate.pass --template client --subject "cn=bob" --san email:bob@example.com --db-path pki/micropki.db
+
+# Сертификат 5: подпись кода
+micropki ca issue-cert --ca-cert pki/certs/intermediate.cert.pem --ca-key pki/private/intermediate.key.pem --ca-pass-file secrets/intermediate.pass --template code_signing --subject "cn=code signer" --db-path pki/micropki.db
+
+# Проверка: вывести все сертификаты из БД
+micropki ca list-certs
+
+# Ожидаемый вывод: 
+# Serial           | Subject                        | Not After  | Status
+# -----------------+--------------------------------+------------+-------
+# 69C42B5FE4242E60 | commonName=code signer         | 2027-03-25 | valid
+# 69C42B5A367058FC | commonName=bob                 | 2027-03-25 | valid
+# 69C42B558DEEF815 | commonName=alice               | 2027-03-25 | valid
+# 69C42B50447D5A48 | commonName=server2.example.com | 2027-03-25 | valid
+# 69C42B45108C0DD0 | commonName=server1.example.com | 2027-03-25 | valid
+```
+
+### TEST-14
+```bash
+# Список всех действительных сертификатов
+micropki ca list-certs --status valid
+# Ожидаемый вывод: таблица с серийными номерами, субъектами, датами, статусами
+
+# Список в формате JSON
+micropki ca list-certs --format json
+# Ожидаемый вывод: JSON-массив с объектами
+
+# Список в формате CSV
+micropki ca list-certs --format csv
+# Ожидаемый вывод: CSV с заголовками
+
+# Показать конкретный сертификат
+micropki ca show-cert 69C42B45108C0DD0
+
+# Ожидаемый вывод:
+# -----BEGIN CERTIFICATE-----
+# MIIEbTCCAlWgAwIBAgIIacQrRRCMDdAwDQYJKoZIhvcNAQELBQAwNjEhMB8GA1UE...
+# -----END CERTIFICATE-----
+```
+
+### TEST-15
+```bash
+
+# Запуск сервера (в отдельном терминале)
+micropki repo serve --host 127.0.0.1 --port 8080
+
+# В другом терминале:
+
+# Получить сертификат по серийному номеру
+curl http://localhost:8080/certificate/69C42B45108C0DD0 --output cert.pem
+# Ожидаемый вывод: PEM-сертификат
+
+# Сравнить с файлом на диске
+diff -s cert.pem pki/certs/server1.example.com.cert.pem
+# Ожидаемый вывод: Files cert.pem and pki/certs/server1.example.com.cert.pem are identical
+```
+
+### TEST-16
+```bash
+# Модульные тесты
+pytest tests/test_api.py -v
+
+# Ожидаемый результат:
+========================================= test session starts ==========================================
+configfile: pyproject.toml
+collected 4 items
+
+tests/test_api.py::test_get_root_ca PASSED                                                               [ 25%]
+tests/test_api.py::test_get_intermediate_ca PASSED                                                       [ 50%]
+tests/test_api.py::test_get_ca_unknown_level PASSED                                                      [ 75%]
+tests/test_api.py::test_crl_returns_501 PASSED                                                           [100%]
+
+========================================== 4 passed in 5.88s ==========================================
+```
+
+### TEST-17, TEST-18
+```bash
+# Модульные тесты
+pytest tests/test_serial.py -v
+
+# Ожидаемый результат:
+========================================= test session starts ==========================================
+configfile: pyproject.toml
+collected 5 items
+
+tests/test_serial.py::test_serial_format PASSED                                                          [ 20%]
+tests/test_serial.py::test_serial_to_hex_roundtrip PASSED                                                [ 40%]
+tests/test_serial.py::test_is_valid_hex PASSED                                                           [ 60%]
+tests/test_serial.py::test_generate_100_unique_serials PASSED                                            [ 80%]
+tests/test_serial.py::test_duplicate_serial_rejected PASSED                                              [100%]
+
+========================================== 5 passed in 0.81s ==========================================
+```
+
+### TEST-19
+```bash
+# Сервер должен быть запущен
+
+# Некорректный hex
+curl http://localhost:8080/certificate/XYZ
+# Ожидаемый вывод: 400 Bad Request, сообщение об ошибке
+
+curl http://localhost:8080/certificate/ZZZZ
+# Ожидаемый вывод: 400 Bad Request
+
+# Несуществующий, но валидный hex
+curl http://localhost:8080/certificate/DEADBEEF
+# Ожидаемый вывод: 404 Not Found
+```
+
+### TEST-20
+```bash
+# Инициализация БД
+micropki db init
+
+# Промежуточный CA
+micropki ca issue-intermediate --root-cert pki/certs/ca.cert.pem --root-key pki/private/ca.key.pem --root-pass-file secrets/root.pass --subject "CN=Integration Intermediate CA" --passphrase-file secrets/intermediate.pass --db-path pki/micropki.db
+
+# 3 конечных сертификата
+micropki ca issue-cert --ca-cert pki/certs/intermediate.cert.pem --ca-key pki/private/intermediate.key.pem --ca-pass-file secrets/intermediate.pass --template server --subject "cn=test1.local" --san dns:test1.local --db-path pki/micropki.db
+
+micropki ca issue-cert --ca-cert pki/certs/intermediate.cert.pem --ca-key pki/private/intermediate.key.pem --ca-pass-file secrets/intermediate.pass --template client --subject "cn=testclient" --san email:test@local.com --db-path pki/micropki.db
+
+micropki ca issue-cert --ca-cert pki/certs/intermediate.cert.pem --ca-key pki/private/intermediate.key.pem --ca-pass-file secrets/intermediate.pass --template code_signing --subject "cn=testsigner" --db-path pki/micropki.db
+
+# Проверяем БД
+micropki ca list-certs
+# Ожидаемый вывод: 4 записи (intermediate + 3 конечных)
+
+# Запуск сервера (в отдельном терминале)
+micropki repo serve
+
+# Получение через API
+curl http://localhost:8080/certificate/<СЕРИЙНЫЙ_НОМЕР_test1.local> --output cert.pem
+# Ожидаемый вывод: PEM-сертификат
+
+# Сравнение
+diff -s cert.pem pki/certs/test1.local.cert.pem
+# Содержимое из API должно совпадать с файлом pki/certs/test1.local.cert.pem
+
+# Проверка CA-эндпоинтов
+curl http://localhost:8080/ca/root
+curl http://localhost:8080/ca/intermediate
+# Ожидаемый вывод: PEM-сертификаты корневого и промежуточного CA
+```
+
 ## Структура выходных файлов
 ```text
 pki/
@@ -554,6 +801,7 @@ pki/
 │   └── MicroPKI_Code_Signer.key.pem
 ├── csrs/
 │   └── intermediate.csr.pem         # CSR промежуточного CA
+├── micropki.db                      # База данных PKI
 └── policy.txt            # документ политики УЦ
 ```
 
@@ -569,13 +817,21 @@ MicroPKI/
 │   ├── chain.py              # модуль проверки цепочки сертификатов
 │   ├── csr.py                # работа с запросами на сертификат
 │   ├── templates.py          # шаблоны сертификатов
+│   ├── config.py             # конфиг сервера
+│   ├── database.py           # работа с базой данных
+│   ├── repository.py         # работа с сертификатами в БД
+│   ├── serial.py             # генератор серийного номера сертификата
+│   ├── server.py             # HTTP-сервер
 │   └── logger.py             # настройка логирования
 ├── tests/
 │   ├── test_csr.py           
 │   ├── test_negative.py               
-│   ├── test_san.py                
+│   ├── test_san.py
+│   ├── test_api.py 
+│   ├── test_serial.py                 
 │   └── test_templates.py
 ├── .gitignore
 ├── pyproject.toml
+├── micropki.conf
 └── README.md
 ```

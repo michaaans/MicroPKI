@@ -6,12 +6,12 @@
 - построение конечных сертификатов по шаблонам
 - парсинг записей SAN
 - сериализация сертификата в PEM
+
 """
 
 import os
 import datetime
 import ipaddress
-from typing import Union
 
 from cryptography import x509
 from cryptography.x509.oid import NameOID, ExtensionOID
@@ -90,7 +90,10 @@ def parse_subject_dn(subject_str: str) -> x509.Name:
 
 def _generate_serial_number() -> int:
     """
-    Генерирует серийный номер для сертификата.
+    Генерирует серийный номер для сертификата (fallback-метод).
+
+    Используется ТОЛЬКО когда БД недоступна (например, при создании
+    корневого CA до инициализации БД).
 
     20 байт случайных данных, старший бит обнулён (≤ 159 бит),
     гарантированно положительный.
@@ -137,6 +140,7 @@ def build_root_ca_certificate(
     subject: x509.Name,
     validity_days: int,
     key_type: str,
+    serial_number: int | None = None,
 ) -> x509.Certificate:
     """
     Создаёт самоподписанный сертификат корневого УЦ.
@@ -145,10 +149,14 @@ def build_root_ca_certificate(
     :param subject: DN субъекта
     :param validity_days: срок действия в днях
     :param key_type: 'rsa' или 'ecc'
+    :param serial_number: серийный номер из генератора уникальных номеров.
+                          Если None — генерируется случайно (обратная совместимость).
     :return: подписанный сертификат X.509 v3
     """
     public_key = private_key.public_key()
-    serial_number = _generate_serial_number()
+
+    if serial_number is None:
+        serial_number = _generate_serial_number()
 
     now = datetime.datetime.now(datetime.timezone.utc)
     not_after = now + datetime.timedelta(days=validity_days)
@@ -164,11 +172,13 @@ def build_root_ca_certificate(
         .not_valid_after(not_after)
     )
 
+    # BasicConstraints: CA=TRUE, критическое
     builder = builder.add_extension(
         x509.BasicConstraints(ca=True, path_length=None),
         critical=True,
     )
 
+    # KeyUsage: keyCertSign + cRLSign + digitalSignature, критическое
     builder = builder.add_extension(
         x509.KeyUsage(
             digital_signature=True,
@@ -184,9 +194,11 @@ def build_root_ca_certificate(
         critical=True,
     )
 
+    # Subject Key Identifier
     ski = x509.SubjectKeyIdentifier.from_public_key(public_key)
     builder = builder.add_extension(ski, critical=False)
 
+    # Authority Key Identifier = SKI (самоподписанный)
     aki = x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(ski)
     builder = builder.add_extension(aki, critical=False)
 
@@ -199,6 +211,7 @@ def build_intermediate_certificate(
     root_cert: x509.Certificate,
     validity_days: int,
     path_length: int,
+    serial_number: int | None = None,
 ) -> x509.Certificate:
     """
     Подписывает CSR промежуточного CA закрытым ключом корневого CA.
@@ -215,15 +228,17 @@ def build_intermediate_certificate(
     :param root_cert: сертификат корневого CA
     :param validity_days: срок действия
     :param path_length: ограничение длины пути
+    :param serial_number: серийный номер из генератора. Если None — случайный.
     :return: подписанный сертификат промежуточного CA
     """
     root_key_type = _detect_key_type(root_private_key)
     signing_hash = _get_signing_hash(root_key_type)
-    serial_number = _generate_serial_number()
+
+    if serial_number is None:
+        serial_number = _generate_serial_number()
 
     now = datetime.datetime.now(datetime.timezone.utc)
     not_after = now + datetime.timedelta(days=validity_days)
-
     intermediate_public_key = csr.public_key()
 
     builder = (
@@ -354,6 +369,7 @@ def build_leaf_certificate(
     san_entries: list[tuple[str, str]],
     validity_days: int,
     leaf_key_type: str,
+    serial_number: int | None = None,
 ) -> x509.Certificate:
     """
     Строит и подписывает конечный сертификат по шаблону.
@@ -362,15 +378,18 @@ def build_leaf_certificate(
     :param leaf_public_key: открытый ключ конечного субъекта
     :param ca_private_key: закрытый ключ промежуточного CA
     :param ca_cert: сертификат промежуточного CA
-    :param template: шаблон сертификата
+    :param template: шаблон сертификата (server, client, code_signing)
     :param san_entries: записи SAN
     :param validity_days: срок действия
     :param leaf_key_type: тип ключа конечного субъекта ('rsa' или 'ecc')
+    :param serial_number: серийный номер из генератора. Если None — случайный.
     :return: подписанный сертификат
     """
     ca_key_type = _detect_key_type(ca_private_key)
     signing_hash = _get_signing_hash(ca_key_type)
-    serial_number = _generate_serial_number()
+
+    if serial_number is None:
+        serial_number = _generate_serial_number()
 
     now = datetime.datetime.now(datetime.timezone.utc)
     not_after = now + datetime.timedelta(days=validity_days)
@@ -424,7 +443,7 @@ def build_leaf_certificate(
 
 def serialize_certificate_pem(certificate: x509.Certificate) -> bytes:
     """
-    Сертификат → PEM-байты.
+    Сертификат → PEM-байты (-----BEGIN CERTIFICATE-----).
 
     :param certificate: объект сертификата
     :return: байты в формате PEM

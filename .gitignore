@@ -24,3 +24,11 @@ logs/
 
 # Pytest cache
 .pytest_cache/
+
+# Database
+*.db
+*.db-wal
+*.db-shm
+
+# Config overrides
+micropki.local.conf
