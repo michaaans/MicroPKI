@@ -658,3 +658,81 @@ def main() -> None:
 
         elif args.ca_action == "show-cert":
             show_cert_cmd(args.db_path, args.serial, logger)
+
+        elif args.ca_action == "revoke":
+            from micropki.revocation import revoke_certificate, validate_reason
+            from micropki.database import check_schema as check_db
+
+            if not check_db(args.db_path):
+                logger.error("БД не инициализирована: %s", args.db_path)
+                print("Ошибка: БД не инициализирована.", file=sys.stderr)
+                sys.exit(1)
+
+            # Валидация причины
+            try:
+                validate_reason(args.reason)
+            except ValueError as e:
+                logger.error("Ошибка валидации: %s", e)
+                print(f"Ошибка: {e}", file=sys.stderr)
+                sys.exit(1)
+
+            # Подтверждение (если не --force)
+            if not args.force:
+                answer = input(
+                    f"Вы уверены, что хотите отозвать сертификат {args.serial}? [y/N]: "
+                )
+                if answer.lower() not in ("y", "yes", "д", "да"):
+                    print("Отмена.")
+                    sys.exit(0)
+
+            result = revoke_certificate(
+                db_path=args.db_path,
+                serial_hex=args.serial,
+                reason=args.reason,
+                logger_inst=logger,
+            )
+
+            print(result["message"])
+
+            if result["status"] == "not_found":
+                sys.exit(1)
+            else:
+                sys.exit(0)
+
+        elif args.ca_action == "gen-crl":
+            from micropki.crl import generate_crl
+            from micropki.crypto_utils import load_encrypted_private_key, load_certificate, read_passphrase
+            from micropki.database import check_schema as check_db
+
+            if not check_db(args.db_path):
+                logger.error("БД не инициализирована: %s", args.db_path)
+                print("Ошибка: БД не инициализирована.", file=sys.stderr)
+                sys.exit(1)
+
+            try:
+                passphrase = read_passphrase(args.ca_pass_file)
+                ca_cert = load_certificate(args.ca_cert)
+                ca_key = load_encrypted_private_key(args.ca_key, passphrase)
+
+                crl_path = generate_crl(
+                    ca_name=args.ca,
+                    ca_cert=ca_cert,
+                    ca_private_key=ca_key,
+                    db_path=args.db_path,
+                    out_dir=args.out_dir,
+                    next_update_days=args.next_update,
+                    out_file=args.out_file,
+                    logger_inst=logger,
+                )
+
+                print(f"CRL сгенерирован: {crl_path}")
+
+                # Затираем парольную фразу
+                ba = bytearray(passphrase)
+                for i in range(len(ba)):
+                    ba[i] = 0
+
+            except Exception as e:
+                logger.error("Ошибка генерации CRL: %s", e)
+                print(f"Ошибка: {e}", file=sys.stderr)
+                sys.exit(1)

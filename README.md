@@ -56,6 +56,12 @@ echo -n "MySecure_Passphrase_IntermediateCA" > secrets/intermediate.pass
 ```bash
 micropki db init --db-path ./pki/micropki.db
 # Вывод: База данных инициализирована: pki\micropki.db
+
+# миграция при изменении таблиц
+
+micropki db init
+# Вывод: Миграция схемы: версия 1 → 2...
+#         Миграция на версию 2 завершена (добавлена таблица crl_metadata)
 ```
 
 Инициализация корневого CA (RSA-4096)
@@ -179,6 +185,59 @@ micropki ca list-certs --format json
 micropki ca show-cert 69C41A28D533E208
 ```
 
+Отзыв сертификата
+```bash
+# Посмотреть список сертификатов чтобы найти серийный номер
+micropki ca list-certs
+
+# Отозвать с подтверждением
+micropki ca revoke 69C41A28D533E208 --reason keyCompromise
+
+# Отозвать без подтверждения
+micropki ca revoke 69C41A28D533E208 --reason superseded --force
+```
+
+Генерация CRL
+```bash
+# CRL промежуточного CA
+micropki ca gen-crl \
+    --ca intermediate \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass
+
+# CRL корневого CA
+micropki ca gen-crl \
+    --ca root \
+    --ca-cert pki/certs/ca.cert.pem \
+    --ca-key pki/private/ca.key.pem \
+    --ca-pass-file secrets/root.pass
+
+# С указанием срока nextUpdate
+micropki ca gen-crl \
+    --ca intermediate \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --next-update 14
+```
+
+Получение CRL через HTTP
+```bash
+# Запуск сервера в фоне или отдельном терминале
+micropki repo serve
+
+# В другом терминале (cmd):
+curl http://localhost:8080/crl --output ca.crl.pem
+
+# С указанием параметра
+curl http://localhost:8080/crl?ca=root --output root.crl.pem
+
+# или
+
+curl http://localhost:8080/crl?ca=intermediate --output intermediate.crl.pem
+```
+
 HTTP-сервер
 ```bash
 # Запуск
@@ -199,8 +258,10 @@ curl http://localhost:8080/ca/intermediate
 # Получить сертификат по серийному номеру
 curl http://localhost:8080/certificate/69C41A28D533E208
 
-# CRL (заглушка)
+# CRL
 curl http://localhost:8080/crl
+curl http://localhost:8080/crl?ca=root
+curl http://localhost:8080/crl?ca=intermediate
 
 # Некорректный серийный номер
 curl http://localhost:8080/certificate/XYZ
@@ -784,6 +845,138 @@ curl http://localhost:8080/ca/intermediate
 # Ожидаемый вывод: PEM-сертификаты корневого и промежуточного CA
 ```
 
+### TEST-21
+```bash
+# 1. Выпустить серверный сертификат
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "cn=revoke-test.local" \
+    --san dns:revoke-test.local \
+    --db-path pki/micropki.db
+
+# 2. Проверить статус — должен быть valid
+micropki ca list-certs --status valid
+# Ожидаемый вывод: запись с revoke-test.local, статус valid
+
+# 3. Отозвать с причиной keyCompromise
+micropki ca revoke 69CA97F1887C8399 --reason keyCompromise --force
+# Ожидаемый вывод: Сертификат 69CA97F1887C8399 успешно отозван.
+
+# 4. Проверить статус — должен быть revoked
+micropki ca list-certs --status revoked
+# Ожидаемый вывод: запись с revoke-test.local, статус revoked
+
+# 5. Сгенерировать CRL
+micropki ca gen-crl \
+    --ca intermediate \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass
+
+# 6. Проверить что CRL содержит отозванный серийный номер
+openssl crl -in pki/crl/intermediate.crl.pem -text -noout
+# Ожидаемый вывод:
+#   Revoked Certificates:
+#       Serial Number: 69CA97F1887C8399
+#           Revocation Date: Mar 30 15:35:12 2026 GMT
+#           CRL entry extensions:
+#               X509v3 CRL Reason Code:
+#                   Key Compromise
+
+# 7. Запустить сервер и получить CRL через HTTP
+micropki repo serve
+
+curl http://localhost:8080/crl -o ca.crl.pem
+
+# Проверяем что CRL одинаковые
+openssl crl -in ca.crl.pem -text -noout
+
+# или
+
+diff -s ca.crl.pem pki/crl/intermediate.crl.pem
+# Ожидаемый вывод: Files ca.crl.pem and pki/crl/intermediate.crl.pem are identical
+```
+
+### TEST-22
+```bash
+openssl crl -in pki/crl/intermediate.crl.pem -CAfile pki/certs/intermediate.cert.pem -noout
+# Ожидаемый вывод: verify OK
+```
+
+### TEST-23
+```bash
+# Первая генерация
+micropki ca gen-crl --ca intermediate --ca-cert pki/certs/intermediate.cert.pem --ca-key pki/private/intermediate.key.pem --ca-pass-file secrets/intermediate.pass
+openssl crl -in pki/crl/intermediate.crl.pem -text -noout
+# Ожидаемый вывод: 
+#Certificate Revocation List (CRL):
+#        Version 2 (0x1)
+#        Signature Algorithm: sha256WithRSAEncryption
+#        Issuer: CN = MicroPKI Intermediate CA, O = MicroPKI
+#        Last Update: Mar 30 15:46:22 2026 GMT
+#        Next Update: Apr  6 15:46:22 2026 GMT
+#        CRL extensions:
+#            X509v3 CRL Number:
+#                3  (номер CRL равен 3)
+
+# Вторая генерация (без новых отзывов)
+micropki ca gen-crl --ca intermediate --ca-cert pki/certs/intermediate.cert.pem --ca-key pki/private/intermediate.key.pem --ca-pass-file secrets/intermediate.pass
+openssl crl -in pki/crl/intermediate.crl.pem -text -noout | findstr "CRL Number"
+# Ожидаемый вывод: 
+#Certificate Revocation List (CRL):
+#        Version 2 (0x1)
+#        Signature Algorithm: sha256WithRSAEncryption
+#        Issuer: CN = MicroPKI Intermediate CA, O = MicroPKI
+#        Last Update: Mar 30 15:51:23 2026 GMT
+#        Next Update: Apr  6 15:51:23 2026 GMT
+#        CRL extensions:
+#            X509v3 CRL Number:
+#                4  (увеличился на 1)
+```
+
+### TEST-24
+```bash
+micropki ca revoke DEADBEEF12345678 --reason unspecified --force
+# Ожидаемый вывод:
+# 2026-03-30T18:52:47 ERROR Сертификат не найден в БД: DEADBEEF12345678
+# Сертификат с серийным номером DEADBEEF12345678 не найден в базе данных.
+```
+
+### TEST-25
+```bash
+micropki ca revoke 69CA97F1887C8399 --reason superseded --force
+# Ожидаемый вывод:
+# 2026-03-30T18:54:15 WARNING Сертификат уже отозван: serial=69CA97F1887C8399, subject=commonName=revoke-test.local, причина=keycompromise, дата=2026-03-30T15:35:12Z
+# Сертификат 69CA97F1887C8399 уже отозван.
+```
+
+### TEST-26
+```bash
+# Запускаем сервер
+micropki repo serve
+
+# Отзываем сертификат
+micropki ca revoke 69C42F7CAE83C15A
+
+# Перегенерируем CRL
+micropki ca gen-crl \
+    --ca intermediate \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass
+
+# Получаем CRL по HTTP
+curl http://localhost:8080/crl --output ca.crl.pem
+
+# Сравниваем с локальным файлом:
+
+diff -s ca.crl.pem pki/crl/intermediate.crl.pem
+# Ожидаемый вывод: Files ca.crl.pem and pki/crl/intermediate.crl.pem are identical
+```
+
 ## Структура выходных файлов
 ```text
 pki/
@@ -801,6 +994,8 @@ pki/
 │   └── MicroPKI_Code_Signer.key.pem
 ├── csrs/
 │   └── intermediate.csr.pem         # CSR промежуточного CA
+├── crl/
+│   └── intermediate.crl.pem         # Списко отозванных сертификатов (CRL)
 ├── micropki.db                      # База данных PKI
 └── policy.txt            # документ политики УЦ
 ```
@@ -816,10 +1011,12 @@ MicroPKI/
 │   ├── crypto_utils.py       # генерация ключей, PEM, шифрование
 │   ├── chain.py              # модуль проверки цепочки сертификатов
 │   ├── csr.py                # работа с запросами на сертификат
+│   ├── crl.py                # работа с CRL
 │   ├── templates.py          # шаблоны сертификатов
 │   ├── config.py             # конфиг сервера
 │   ├── database.py           # работа с базой данных
 │   ├── repository.py         # работа с сертификатами в БД
+│   ├── revocation.py         # работа с отзывом сертификатов
 │   ├── serial.py             # генератор серийного номера сертификата
 │   ├── server.py             # HTTP-сервер
 │   └── logger.py             # настройка логирования

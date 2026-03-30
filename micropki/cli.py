@@ -196,6 +196,42 @@ def create_parser() -> argparse.ArgumentParser:
                          default=None,
                          type=Path)
 
+    # --- ca revoke ---
+    ca_revoke = ca_sub.add_parser("revoke", help="Отозвать сертификат")
+    ca_revoke.add_argument("serial", type=str, help="Серийный номер в hex")
+    ca_revoke.add_argument(
+        "--reason",
+        default="unspecified",
+        help="Причина отзыва (по умолчанию: unspecified). "
+             "Допустимые: keyCompromise, cACompromise, affiliationChanged, "
+             "superseded, cessationOfOperation, certificateHold, "
+             "removeFromCRL, privilegeWithdrawn, aACompromise",
+    )
+    ca_revoke.add_argument("--force", action="store_true", default=False,
+                           help="Без запроса подтверждения")
+    ca_revoke.add_argument("--db-path", default=Path("./pki/micropki.db"), type=Path)
+    ca_revoke.add_argument("--log-file", default=None, type=Path)
+
+    # --- ca gen-crl ---
+    ca_gencrl = ca_sub.add_parser("gen-crl", help="Сгенерировать CRL")
+    ca_gencrl.add_argument(
+        "--ca", required=True,
+        help="Имя CA: 'root' или 'intermediate'",
+    )
+    ca_gencrl.add_argument("--ca-cert", required=True, type=Path,
+                           help="Путь к сертификату CA")
+    ca_gencrl.add_argument("--ca-key", required=True, type=Path,
+                           help="Путь к закрытому ключу CA")
+    ca_gencrl.add_argument("--ca-pass-file", required=True, type=Path,
+                           help="Парольная фраза для ключа CA")
+    ca_gencrl.add_argument("--next-update", default=7, type=int,
+                           help="Дней до следующего обновления CRL (по умолчанию: 7)")
+    ca_gencrl.add_argument("--out-file", default=None, type=Path,
+                           help="Путь к выходному файлу CRL")
+    ca_gencrl.add_argument("--out-dir", default=Path("./pki"), type=Path)
+    ca_gencrl.add_argument("--db-path", default=Path("./pki/micropki.db"), type=Path)
+    ca_gencrl.add_argument("--log-file", default=None, type=Path)
+
     # ==================== db ====================
     db_parser = top_sub.add_parser("db",
                                    help="Управление базой данных")
