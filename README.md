@@ -197,6 +197,11 @@ micropki ca revoke 69C41A28D533E208 --reason keyCompromise
 micropki ca revoke 69C41A28D533E208 --reason superseded --force
 ```
 
+**Допустимые причины отзыва:**
+`unspecified`, `keyCompromise`, `cACompromise`, `affiliationChanged`,
+`superseded`, `cessationOfOperation`, `certificateHold`, `removeFromCRL`,
+`privilegeWithdrawn`, `aACompromise`
+
 Генерация CRL
 ```bash
 # CRL промежуточного CA
@@ -266,6 +271,106 @@ curl http://localhost:8080/crl?ca=intermediate
 # Некорректный серийный номер
 curl http://localhost:8080/certificate/XYZ
 ```
+
+OCSP-Responder
+```bash
+# Создать цепочку CA в локальной папке (для проверки openssl)
+cat ./pki/certs/intermediate.cert.pem ./pki/certs/ca.cert.pem > ./pki/certs/ca-chain.pem
+```
+
+Выпуск сертификата OCSP-ответчика
+```bash
+micropki ca issue-ocsp-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --subject "CN=OCSP Responder,O=MicroPKI" \
+    --key-type rsa \
+    --key-size 2048 \
+    --san dns:ocsp.example.com \
+    --out-dir pki/certs \
+    --validity-days 365 \
+    --db-path pki/micropki.db
+```
+
+Проверка сертификата OCSP-ответчика
+```bash
+openssl x509 -in pki/certs/OCSP_Responder.cert.pem -text -noout
+
+# В выводе должны присутствовать:
+# X509v3 Basic Constraints: critical
+#     CA:FALSE
+# X509v3 Key Usage: critical
+#     Digital Signature
+# X509v3 Extended Key Usage:
+#     OCSP Signing
+```
+
+Запуск OCSP-ответчика
+```bash
+# В отдельном терминале или в фоне
+micropki ocsp serve \
+    --host 127.0.0.1 \
+    --port 8081 \
+    --db-path pki/micropki.db \
+    --responder-cert pki/certs/OCSP_Responder.cert.pem \
+    --responder-key pki/certs/OCSP_Responder.key.pem \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --cache-ttl 120
+```
+
+Проверка работоспособности:
+```bash
+curl http://127.0.0.1:8081/health
+# Ожидается: {"status":"ok","service":"MicroPKI OCSP Responder"}
+```
+
+Выпустить тестовый сертификат
+```bash
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=test.example.com" \
+    --san dns:test.example.com \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+```
+
+Запросить статус — ожидается good
+```bash
+openssl ocsp \
+    -issuer pki/certs/intermediate.cert.pem \
+    -cert pki/certs/test.example.com.cert.pem \
+    -url http://127.0.0.1:8081/ocsp \
+    -resp_text \
+    -nonce \
+    -CAfile pki/certs/ca-chain.pem \
+    -verify_other pki/certs/OCSP_Responder.cert.pem
+
+#Ожидаемый вывод:
+#OCSP Response Status: successful (0x0)
+#Cert Status: good
+#Response verify OK
+#test.example.com.cert.pem: good
+#    This Update: ...
+#    Next Update: ...
+#Response Extensions:
+#    OCSP Nonce: 0410...   ← nonce присутствует (мы передали -nonce)
+```
+
+### Nonce в OCSP и защита от повторов
+Nonce (одноразовое число) в OCSP — расширение с OID 1.3.6.1.5.5.7.48.1.2, которое защищает от атак повтора (replay attacks).
+
+**Как это работает**:
+- Клиент генерирует случайное число (nonce) и включает его в OCSP-запрос.
+- OCSP-ответчик обязан включить точно такое же значение nonce в ответ.
+- Клиент проверяет: nonce в ответе == nonce в запросе. Если нет — ответ отвергается.
+
+**Почему это важно**:
+- Без nonce злоумышленник может перехватить старый OCSP-ответ (например, со статусом good) и предъявить его позже, даже если сертификат уже отозван. Nonce делает каждый ответ уникальным и привязанным к конкретному запросу.
+
 
 ## Тестирование
 ### TEST-1
@@ -977,6 +1082,323 @@ diff -s ca.crl.pem pki/crl/intermediate.crl.pem
 # Ожидаемый вывод: Files ca.crl.pem and pki/crl/intermediate.crl.pem are identical
 ```
 
+### TEST-28
+```bash
+# Выпустить сертификат OCSP-ответчика
+micropki ca issue-ocsp-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --subject "CN=OCSP Responder,O=MicroPKI" \
+    --key-type rsa \
+    --key-size 2048 \
+    --san dns:ocsp.example.com \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+# Ожидаемый вывод:
+#   ПРЕДУПРЕЖДЕНИЕ: Ключ OCSP-ответчика сохранён без шифрования!
+#   Сертификат OCSP-ответчика: pki/certs/OCSP_Responder.cert.pem
+#   Ключ OCSP-ответчика: pki/certs/OCSP_Responder.key.pem
+
+# Проверить расширения
+openssl x509 -in pki/certs/OCSP_Responder.cert.pem -text -noout
+# Ожидаемый вывод (фрагмент):
+#   X509v3 Basic Constraints: critical
+#       CA:FALSE
+#   X509v3 Key Usage: critical
+#       Digital Signature
+#   X509v3 Extended Key Usage:
+#       OCSP Signing
+#   (НЕТ keyCertSign, НЕТ cRLSign)
+
+# Проверить что сертификат подписан промежуточным CA
+openssl verify \
+    -CAfile pki/certs/ca.cert.pem \
+    -untrusted pki/certs/intermediate.cert.pem \
+    pki/certs/OCSP_Responder.cert.pem
+# Ожидаемый вывод: pki/certs/OCSP_Responder.cert.pem: OK
+```
+
+### TEST-29
+```bash
+# Выпустить серверный сертификат для теста
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=ocsp-test.local" \
+    --san dns:ocsp-test.local \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Запустить OCSP-ответчик (в отдельном терминале)
+micropki ocsp serve \
+    --responder-cert pki/certs/OCSP_Responder.cert.pem \
+    --responder-key pki/certs/OCSP_Responder.key.pem \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --db-path pki/micropki.db \
+    --port 8081
+
+# Запросить статус с nonce и верификацией подписи
+openssl ocsp \
+    -issuer pki/certs/intermediate.cert.pem \
+    -cert pki/certs/ocsp-test.local.cert.pem \
+    -url http://127.0.0.1:8081/ocsp \
+    -resp_text \
+    -nonce \
+    -CAfile pki/certs/ca-chain.pem \
+    -verify_other pki/certs/OCSP_Responder.cert.pem
+# Ожидаемый вывод:
+# Response Extensions:
+#         OCSP Nonce:
+#             04106765B414A0B3636DB65082DA782E1F86
+# Response verify OK
+# pki/certs/ocsp-test.local.cert.pem: revoked
+#         This Update: Apr  6 15:03:13 2026 GMT
+#         Next Update: Apr  6 15:05:13 2026 GMT
+#         Reason: keyCompromise
+#         Revocation Time: Apr  6 12:02:22 2026 GMT
+```
+
+### TEST-30
+```bash
+# Получить серийный номер сертификата ocsp-test.local
+micropki ca list-certs --db-path pki/micropki.db --format json
+# Найти serial_hex для CN=ocsp-test.local
+
+# Отозвать сертификат
+micropki ca revoke 69D3A07DB8063AE9 \
+    --reason keyCompromise \
+    --force \
+    --db-path pki/micropki.db
+# Ожидаемый вывод: Сертификат 69D3A07DB8063AE9 успешно отозван.
+
+# Запросить статус через OCSP (ответчик должен быть запущен)
+openssl ocsp \
+    -issuer pki/certs/intermediate.cert.pem \
+    -cert pki/certs/ocsp-test.local.cert.pem \
+    -url http://127.0.0.1:8081/ocsp \
+    -resp_text \
+    -no_nonce \
+    -CAfile pki/certs/ca-chain.pem \
+    -verify_other pki/certs/OCSP_Responder.cert.pem
+# Ожидаемый вывод:
+# Response verify OK
+# pki/certs/ocsp-test.local.cert.pem: revoked
+#         This Update: Apr  6 15:05:13 2026 GMT
+#         Next Update: Apr  6 15:07:13 2026 GMT
+#         Reason: keyCompromise
+#         Revocation Time: Apr  6 12:02:22 2026 GMT
+```
+
+### TEST-31
+```bash
+# Запросить несуществующий серийный номер
+openssl ocsp \
+    -issuer pki/certs/intermediate.cert.pem \
+    -serial 0xDEADBEEF00000001 \
+    -url http://127.0.0.1:8081/ocsp \
+    -resp_text \
+    -no_nonce \
+    -CAfile pki/certs/ca-chain.pem \
+    -verify_other pki/certs/OCSP_Responder.cert.pem
+# Ожидаемый вывод:
+# Response verify OK
+# 0xDEADBEEF00000001: unknown
+#         This Update: Apr  6 15:06:06 2026 GMT
+#         Next Update: Apr  6 15:08:06 2026 GMT
+```
+
+### TEST-32
+```bash
+# Запрос С nonce (-nonce)
+openssl ocsp \
+    -issuer pki/certs/intermediate.cert.pem \
+    -cert pki/certs/ocsp-test.local.cert.pem \
+    -url http://127.0.0.1:8081/ocsp \
+    -resp_text \
+    -nonce \
+    -CAfile pki/certs/ca-chain.pem \
+    -verify_other pki/certs/OCSP_Responder.cert.pem
+# Ожидаемый вывод: 
+# Response Extensions:
+#         OCSP Nonce:
+#             0410AA55864FFD23C7BB31662F2ADADC7295
+
+# Запрос БЕЗ nonce (-no_nonce)
+openssl ocsp \
+    -issuer pki/certs/intermediate.cert.pem \
+    -cert pki/certs/ocsp-test.local.cert.pem \
+    -url http://127.0.0.1:8081/ocsp \
+    -resp_text \
+    -no_nonce \
+    -CAfile pki/certs/ca-chain.pem \
+    -verify_other pki/certs/OCSP_Responder.cert.pem
+# Ожидаемый вывод: секция "Response Extensions" отсутствует
+```
+
+### TEST-33
+```bash
+# Сохранить ответ в файл
+openssl ocsp \
+    -issuer pki/certs/intermediate.cert.pem \
+    -cert pki/certs/ocsp-test.local.cert.pem \
+    -url http://127.0.0.1:8081/ocsp \
+    -respout pki/ocsp/response.der \
+    -no_nonce \
+    -CAfile pki/certs/ca-chain.pem \
+    -verify_other pki/certs/OCSP_Responder.cert.pem
+# Ожидаемый вывод: Response verify OK
+
+# Верифицировать сохранённый ответ отдельно
+openssl ocsp \
+    -respin pki/ocsp/response.der \
+    -CAfile pki/certs/ca-chain.pem \
+    -verify_other pki/certs/OCSP_Responder.cert.pem \
+    -no_nonce
+# Ожидаемый вывод: Response verify OK
+```
+
+### TEST-34
+```bash
+# Создать файл с мусорными данными
+printf '\x00\x01\x02\x03\xff\xfe' > /tmp/bad_request.der
+
+# Отправить некорректный запрос
+curl -s -X POST http://127.0.0.1:8081/ocsp \
+    -H "Content-Type: application/ocsp-request" \
+    --data-binary @/tmp/bad_request.der \
+    -o /tmp/bad_response.der \
+    -w "\nHTTP Status: %{http_code}\n"
+# Ожидаемый вывод: HTTP Status: 400
+
+# Проверить что ответ — корректный OCSP malformedRequest
+openssl ocsp -respin /tmp/bad_response.der -resp_text 2>&1 | head -3
+# Ожидаемый вывод:
+#   OCSP Response Data:
+#       OCSP Response Status: malformedRequest (0x1)
+```
+
+### TEST-35
+```bash
+# Создать сертификат от неизвестного CA
+openssl req -x509 -newkey rsa:2048 \
+    -keyout /tmp/unknown_ca.key.pem \
+    -out /tmp/unknown_ca.cert.pem \
+    -days 1 -nodes \
+    -subj "/CN=Unknown CA"
+
+openssl req -newkey rsa:2048 \
+    -keyout /tmp/foreign.key.pem \
+    -out /tmp/foreign.csr.pem \
+    -nodes \
+    -subj "/CN=foreign.example.com"
+
+openssl x509 -req \
+    -in /tmp/foreign.csr.pem \
+    -CA /tmp/unknown_ca.cert.pem \
+    -CAkey /tmp/unknown_ca.key.pem \
+    -CAcreateserial \
+    -out /tmp/foreign.cert.pem \
+    -days 1
+
+# Запросить статус — издатель не наш CA
+openssl ocsp \
+    -issuer pki/certs/intermediate.cert.pem \
+    -cert /tmp/foreign.cert.pem \
+    -url http://127.0.0.1:8081/ocsp \
+    -resp_text \
+    -no_nonce \
+    -CAfile pki/certs/ca-chain.pem \
+    -verify_other pki/certs/OCSP_Responder.cert.pem
+# Ожидаемый вывод:
+#   Response verify OK
+#   /tmp/foreign.cert.pem: unknown
+```
+
+
+### TEST-37
+```bash
+# Выпустить новый сертификат
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=integration-test.local" \
+    --san dns:integration-test.local \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Выпустить сертификат OCSP-ответчика
+micropki ca issue-ocsp-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --subject "CN=OCSP Responder,O=MicroPKI" \
+    --key-type rsa \
+    --key-size 2048 \
+    --san dns:ocsp.example.com \
+    --out-dir pki/certs \
+    --validity-days 365 \
+    --db-path pki/micropki.db
+
+# Запустить OCSP-ответчик
+micropki ocsp serve \
+    --host 127.0.0.1 \
+    --port 8081 \
+    --db-path pki/micropki.db \
+    --responder-cert pki/certs/OCSP_Responder.cert.pem \
+    --responder-key pki/certs/OCSP_Responder.key.pem \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --cache-ttl 120
+
+# Проверить работу ответчика
+curl http://127.0.0.1:8081/health
+# Ожидаемый вывод: {"status":"ok","service":"MicroPKI OCSP Responder"}
+
+# Статус — ожидается good
+openssl ocsp \
+    -issuer pki/certs/intermediate.cert.pem \
+    -cert pki/certs/integration-test.local.cert.pem \
+    -url http://127.0.0.1:8081/ocsp \
+    -resp_text -nonce \
+    -CAfile pki/certs/ca-chain.pem \
+    -verify_other pki/certs/OCSP_Responder.cert.pem
+# Ожидаемый вывод:
+#   Response verify OK
+#   integration-test.local.cert.pem: good
+
+# Получить серийный номер
+micropki ca list-certs --db-path pki/micropki.db
+# Найти serial_hex для CN=integration-test.local
+
+# Отозвать
+micropki ca revoke 69D39E3502A0098F \
+    --reason superseded \
+    --force \
+    --db-path pki/micropki.db
+# Ожидаемый вывод: Сертификат 69D39E3502A0098F успешно отозван.
+
+# Статус — ожидается revoked
+openssl ocsp \
+    -issuer pki/certs/intermediate.cert.pem \
+    -cert pki/certs/integration-test.local.cert.pem \
+    -url http://127.0.0.1:8081/ocsp \
+    -resp_text -nonce \
+    -CAfile pki/certs/ca-chain.pem \
+    -verify_other pki/certs/OCSP_Responder.cert.pem
+# Ожидаемый вывод:
+# Response verify OK
+# pki/certs/integration-test.local.cert.pem: revoked
+#         This Update: Apr  6 15:11:29 2026 GMT
+#         Next Update: Apr  6 15:13:29 2026 GMT
+#         Reason: superseded
+#         Revocation Time: Apr  6 11:52:38 2026 GMT
+```
+
+
 ## Структура выходных файлов
 ```text
 pki/
@@ -996,6 +1418,8 @@ pki/
 │   └── intermediate.csr.pem         # CSR промежуточного CA
 ├── crl/
 │   └── intermediate.crl.pem         # Списко отозванных сертификатов (CRL)
+├── ocsp/
+│   └── response.der                 # Сохранённые OCSP-ответы (опционально)
 ├── micropki.db                      # База данных PKI
 └── policy.txt            # документ политики УЦ
 ```
@@ -1019,6 +1443,8 @@ MicroPKI/
 │   ├── revocation.py         # работа с отзывом сертификатов
 │   ├── serial.py             # генератор серийного номера сертификата
 │   ├── server.py             # HTTP-сервер
+│   ├── ocsp.py               # работа с OCSP
+│   ├── ocsp_responder.py     # Сервер OCSP
 │   └── logger.py             # настройка логирования
 ├── tests/
 │   ├── test_csr.py           

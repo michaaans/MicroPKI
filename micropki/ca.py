@@ -2,13 +2,13 @@
 Главный модуль удостоверяющего центра.
 
 Содержит все операции CA:
-- init_root_ca       — инициализация корневого CA
-- issue_intermediate — создание промежуточного CA
-- issue_leaf_cert    — выпуск конечного сертификата
-- list_certs_cmd     — вывод списка сертификатов
-- show_cert_cmd      — вывод конкретного сертификата
-- main               — точка входа CLI
-
+- init_root_ca         — инициализация корневого CA
+- issue_intermediate   — создание промежуточного CA
+- issue_leaf_cert      — выпуск конечного сертификата
+- issue_ocsp_cert      — выпуск сертификата OCSP-ответчика
+- list_certs_cmd       — вывод списка сертификатов
+- show_cert_cmd        — вывод конкретного сертификата
+- main                 — точка входа CLI
 """
 
 import sys
@@ -39,6 +39,7 @@ from micropki.certificates import (
     build_root_ca_certificate,
     build_intermediate_certificate,
     build_leaf_certificate,
+    build_ocsp_cert,
     parse_san_entries,
     serialize_certificate_pem,
 )
@@ -176,9 +177,7 @@ def _save_cert_to_db(
     cert_pem: str,
     logger: logging.Logger,
 ) -> None:
-    """
-    Вставляет сертификат в БД (если db_path указан и БД инициализирована).
-    """
+    """Вставляет сертификат в БД (если db_path указан и БД инициализирована)."""
     if db_path is None:
         return
 
@@ -267,11 +266,10 @@ def init_root_ca(subject, key_type, key_size, passphrase_file, out_dir,
         logger.info("Чтение парольной фразы из файла")
         passphrase = read_passphrase(passphrase_file)
 
-        # Генерация серийного номера
         if db_path and check_schema(db_path):
             serial_number = generate_unique_serial(db_path)
         else:
-            serial_number = None  # сертификат сам сгенерирует
+            serial_number = None
 
         logger.info("Запуск генерации ключа: type=%s, size=%d", key_type, key_size)
         private_key = generate_private_key(key_type, key_size)
@@ -287,18 +285,14 @@ def init_root_ca(subject, key_type, key_size, passphrase_file, out_dir,
         logger.info("Подписание сертификата завершено успешно")
 
         cert_pem = serialize_certificate_pem(certificate)
-
-        # Вставка в БД (до записи файлов — атомарность)
         _save_cert_to_db(db_path, certificate, cert_pem, logger)
 
-        # Сохранение ключа
         private_dir = out_dir / "private"
         private_dir.mkdir(parents=True, exist_ok=True)
         key_pem = serialize_private_key_pem(private_key, passphrase)
         save_key_file(key_pem, key_path)
         logger.info("Закрытый ключ сохранён в %s", key_path.resolve())
 
-        # Сохранение сертификата
         certs_dir = out_dir / "certs"
         certs_dir.mkdir(parents=True, exist_ok=True)
         cert_path.write_bytes(cert_pem)
@@ -332,7 +326,6 @@ def issue_intermediate(root_cert_path, root_key_path, root_pass_file, subject,
         root_cert = load_certificate(root_cert_path)
         root_private_key = load_encrypted_private_key(root_key_path, root_passphrase)
 
-        # Серийный номер
         if db_path and check_schema(db_path):
             serial_number = generate_unique_serial(db_path)
         else:
@@ -404,7 +397,6 @@ def issue_leaf_cert(ca_cert_path, ca_key_path, ca_pass_file, template_name,
         template = get_template(template_name)
         san_entries = parse_san_entries(san_strings)
 
-        # Серийный номер
         if db_path and check_schema(db_path):
             serial_number = generate_unique_serial(db_path)
         else:
@@ -426,8 +418,6 @@ def issue_leaf_cert(ca_cert_path, ca_key_path, ca_pass_file, template_name,
         logger.info("Выпуск конечного сертификата завершён")
 
         cert_pem = serialize_certificate_pem(leaf_cert)
-
-        # Вставка в БД ДО записи файлов (атомарность, PKI-17)
         _save_cert_to_db(db_path, leaf_cert, cert_pem, logger)
 
         cn = get_cn_from_subject(subject_name)
@@ -454,6 +444,110 @@ def issue_leaf_cert(ca_cert_path, ca_key_path, ca_pass_file, template_name,
                 ba[i] = 0
 
 
+def issue_ocsp_cert(
+    ca_cert_path, ca_key_path, ca_pass_file, subject,
+    san_strings, key_type, key_size, out_dir, validity_days,
+    logger, db_path=None,
+):
+    """
+    Выпуск сертификата OCSP-ответчика.
+
+    Профиль (OSC-1):
+    - BasicConstraints: CA=FALSE (критическое)
+    - KeyUsage: digitalSignature (критическое)
+    - ExtendedKeyUsage: id-kp-OCSPSigning (1.3.6.1.5.5.7.3.9)
+    - Ключ хранится БЕЗ шифрования (0o600) — OSC-3
+    """
+    ca_passphrase: bytes = b""
+    try:
+        logger.info("Чтение парольной фразы УЦ для выпуска OCSP-сертификата")
+        ca_passphrase = read_passphrase(ca_pass_file)
+        ca_cert = load_certificate(ca_cert_path)
+        ca_private_key = load_encrypted_private_key(ca_key_path, ca_passphrase)
+
+        # Размер ключа по умолчанию (OSC-2)
+        if key_size is None:
+            key_size = 2048 if key_type == "rsa" else 256
+
+        if db_path and check_schema(db_path):
+            serial_number = generate_unique_serial(db_path)
+        else:
+            serial_number = None
+
+        logger.info("Генерация ключа OCSP-ответчика: type=%s, size=%d", key_type, key_size)
+        ocsp_private_key = generate_private_key(key_type, key_size)
+        logger.info("Генерация ключа OCSP-ответчика завершена")
+
+        san_entries = parse_san_entries(san_strings)
+        subject_name = parse_subject_dn(subject)
+
+        logger.info("Выпуск сертификата OCSP-ответчика: субъект=%s", subject)
+        ocsp_certificate = build_ocsp_cert(
+            subject=subject_name,
+            ocsp_public_key=ocsp_private_key.public_key(),
+            ca_private_key=ca_private_key,
+            ca_cert=ca_cert,
+            san_entries=san_entries,
+            validity_days=validity_days,
+            serial_number=serial_number,
+        )
+        logger.info("Сертификат OCSP-ответчика выпущен")
+
+        cert_pem = serialize_certificate_pem(ocsp_certificate)
+        _save_cert_to_db(db_path, ocsp_certificate, cert_pem, logger)
+
+        # Имена файлов на основе CN
+        cn = get_cn_from_subject(subject_name)
+        safe_name = sanitize_filename(cn)
+        cert_filename = f"{safe_name}.cert.pem"
+        key_filename = f"{safe_name}.key.pem"
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # STR-18: создаём каталог ocsp
+        ocsp_dir = out_dir.parent / "ocsp"
+        ocsp_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Каталог OCSP создан/проверен: %s", ocsp_dir)
+
+        cert_path = out_dir / cert_filename
+        cert_path.write_bytes(cert_pem)
+        logger.info("Сертификат OCSP-ответчика сохранён: %s", cert_path.resolve())
+
+        # OSC-3: ключ хранится БЕЗ шифрования, права 0o600
+        key_path = out_dir / key_filename
+        key_pem = serialize_private_key_pem_unencrypted(ocsp_private_key)
+        save_key_file(key_pem, key_path)
+
+        # OSC-3: обязательное предупреждение
+        logger.warning(
+            "ВНИМАНИЕ: Ключ OCSP-ответчика сохранён БЕЗ ШИФРОВАНИЯ в %s. "
+            "Права доступа 0o600 установлены. Защитите файл от посторонних.",
+            key_path.resolve(),
+        )
+        print(
+            f"\nПРЕДУПРЕЖДЕНИЕ: Ключ OCSP-ответчика сохранён без шифрования!\n"
+            f"  Файл: {key_path}\n"
+            f"  Это необходимо для автоматического запуска ответчика.\n"
+            f"  Убедитесь, что файл доступен только процессу OCSP-ответчика.\n",
+            file=sys.stderr,
+        )
+
+        serial_hex = serial_to_hex(ocsp_certificate.serial_number)
+        logger.info(
+            "Аудит: serial=%s, subject=%s, type=ocsp-signing",
+            serial_hex, subject,
+        )
+
+        print(f"Сертификат OCSP-ответчика: {cert_path}")
+        print(f"Ключ OCSP-ответчика:       {key_path}")
+
+    finally:
+        if ca_passphrase:
+            ba = bytearray(ca_passphrase)
+            for i in range(len(ba)):
+                ba[i] = 0
+
+
 def list_certs_cmd(db_path, status, output_format, logger):
     """Вывод списка сертификатов из БД."""
     if not check_schema(db_path):
@@ -468,7 +562,6 @@ def list_certs_cmd(db_path, status, output_format, logger):
         return
 
     if output_format == "json":
-        # Убираем cert_pem для краткости
         for c in certs:
             c.pop("cert_pem", None)
         print(json.dumps(certs, indent=2, ensure_ascii=False))
@@ -482,7 +575,6 @@ def list_certs_cmd(db_path, status, output_format, logger):
         print(output.getvalue())
 
     else:  # table
-        # Вычисляем ширину столбцов
         headers = ["Serial", "Subject", "Not After", "Status"]
         rows = []
         for c in certs:
@@ -560,7 +652,6 @@ def main() -> None:
 
         if args.repo_action == "serve":
             logger = setup_logger(getattr(args, "log_file", None))
-            # Настраиваем HTTP-логгер
             http_log = logging.getLogger("micropki.http")
             if not http_log.handlers:
                 for handler in logger.handlers:
@@ -575,6 +666,39 @@ def main() -> None:
                 )
             except Exception as e:
                 logger.error("Ошибка сервера: %s", e)
+                print(f"Ошибка: {e}", file=sys.stderr)
+                sys.exit(1)
+
+    elif args.command == "ocsp":
+        if getattr(args, "ocsp_action", None) is None:
+            parser.parse_args(["ocsp", "--help"])
+            sys.exit(1)
+
+        if args.ocsp_action == "serve":
+            logger = setup_logger(getattr(args, "log_file", None))
+
+            # Настраиваем логгеры OCSP
+            for log_name in ("micropki.ocsp", "micropki.ocsp.access"):
+                ocsp_log = logging.getLogger(log_name)
+                if not ocsp_log.handlers:
+                    for handler in logger.handlers:
+                        ocsp_log.addHandler(handler)
+                    ocsp_log.setLevel(logging.DEBUG)
+
+            try:
+                from micropki.ocsp_responder import run_ocsp_server
+                run_ocsp_server(
+                    host=args.host,
+                    port=args.port,
+                    db_path=str(args.db_path),
+                    responder_cert_path=str(args.responder_cert),
+                    responder_key_path=str(args.responder_key),
+                    ca_cert_path=str(args.ca_cert),
+                    cache_ttl=args.cache_ttl,
+                    log_file=str(args.log_file) if args.log_file else None,
+                )
+            except Exception as e:
+                logger.error("Ошибка OCSP-ответчика: %s", e)
                 print(f"Ошибка: {e}", file=sys.stderr)
                 sys.exit(1)
 
@@ -653,6 +777,50 @@ def main() -> None:
                 print(f"Ошибка: {e}", file=sys.stderr)
                 sys.exit(1)
 
+        elif args.ca_action == "issue-ocsp-cert":
+            if args.key_size is None:
+                args.key_size = 2048 if args.key_type == "rsa" else 256
+
+            errors = []
+            if not args.subject or not args.subject.strip():
+                errors.append("--subject должен быть непустой строкой.")
+            errors.extend(_validate_file_exists(args.ca_cert, "--ca-cert"))
+            errors.extend(_validate_file_exists(args.ca_key, "--ca-key"))
+            errors.extend(_validate_passphrase_file(args.ca_pass_file))
+            errors.extend(_validate_positive_int(args.validity_days, "--validity-days"))
+            errors.extend(_validate_out_dir(args.out_dir))
+            if args.key_type == "rsa" and args.key_size < 2048:
+                errors.append("RSA ключ для OCSP должен быть >= 2048 бит.")
+            if args.key_type == "ecc" and args.key_size < 256:
+                errors.append("ECC ключ для OCSP должен быть >= 256 бит.")
+
+            if errors:
+                for err in errors:
+                    logger.error("Ошибка валидации: %s", err)
+                    print(f"Ошибка: {err}", file=sys.stderr)
+                sys.exit(1)
+
+            try:
+                issue_ocsp_cert(
+                    ca_cert_path=args.ca_cert,
+                    ca_key_path=args.ca_key,
+                    ca_pass_file=args.ca_pass_file,
+                    subject=args.subject,
+                    san_strings=args.san,
+                    key_type=args.key_type,
+                    key_size=args.key_size,
+                    out_dir=args.out_dir,
+                    validity_days=args.validity_days,
+                    logger=logger,
+                    db_path=args.db_path,
+                )
+            except SystemExit:
+                raise
+            except Exception as e:
+                logger.error("Ошибка выпуска OCSP-сертификата: %s", e)
+                print(f"Ошибка: {e}", file=sys.stderr)
+                sys.exit(1)
+
         elif args.ca_action == "list-certs":
             list_certs_cmd(args.db_path, args.status, args.output_format, logger)
 
@@ -668,7 +836,6 @@ def main() -> None:
                 print("Ошибка: БД не инициализирована.", file=sys.stderr)
                 sys.exit(1)
 
-            # Валидация причины
             try:
                 validate_reason(args.reason)
             except ValueError as e:
@@ -676,7 +843,6 @@ def main() -> None:
                 print(f"Ошибка: {e}", file=sys.stderr)
                 sys.exit(1)
 
-            # Подтверждение (если не --force)
             if not args.force:
                 answer = input(
                     f"Вы уверены, что хотите отозвать сертификат {args.serial}? [y/N]: "
@@ -727,7 +893,6 @@ def main() -> None:
 
                 print(f"CRL сгенерирован: {crl_path}")
 
-                # Затираем парольную фразу
                 ba = bytearray(passphrase)
                 for i in range(len(ba)):
                     ba[i] = 0

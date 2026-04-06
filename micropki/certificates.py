@@ -449,3 +449,108 @@ def serialize_certificate_pem(certificate: x509.Certificate) -> bytes:
     :return: байты в формате PEM
     """
     return certificate.public_bytes(serialization.Encoding.PEM)
+
+
+def build_ocsp_cert(
+    subject: x509.Name,
+    ocsp_public_key,
+    ca_private_key: PrivateKeyTypes,
+    ca_cert: x509.Certificate,
+    san_entries: list[tuple[str, str]],
+    validity_days: int,
+    serial_number: int | None = None,
+) -> x509.Certificate:
+    """
+    Строит сертификат OCSP-ответчика.
+
+    Профиль:
+    - BasicConstraints: CA=FALSE, критическое
+    - KeyUsage: digitalSignature (критическое), без keyCertSign/cRLSign
+    - ExtendedKeyUsage: id-kp-OCSPSigning (1.3.6.1.5.5.7.3.9)
+    - SAN: опционально
+    - SKI / AKI: стандартные
+
+    :param subject: DN субъекта OCSP-ответчика
+    :param ocsp_public_key: открытый ключ OCSP-ответчика
+    :param ca_private_key: закрытый ключ подписывающего CA
+    :param ca_cert: сертификат подписывающего CA
+    :param san_entries: записи SAN (опционально)
+    :param validity_days: срок действия
+    :param serial_number: серийный номер (None → случайный)
+    :return: подписанный сертификат OCSP-ответчика
+    """
+    from cryptography.x509.oid import ExtendedKeyUsageOID
+    from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
+
+    # OID для OCSPSigning
+    OCSP_SIGNING_OID = x509.ObjectIdentifier("1.3.6.1.5.5.7.3.9")
+
+    ca_key_type = _detect_key_type(ca_private_key)
+    signing_hash = _get_signing_hash(ca_key_type)
+
+    if serial_number is None:
+        serial_number = _generate_serial_number()
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    not_after = now + datetime.timedelta(days=validity_days)
+
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(ca_cert.subject)
+        .public_key(ocsp_public_key)
+        .serial_number(serial_number)
+        .not_valid_before(now)
+        .not_valid_after(not_after)
+    )
+
+    # BasicConstraints: CA=FALSE, критическое
+    builder = builder.add_extension(
+        x509.BasicConstraints(ca=False, path_length=None),
+        critical=True,
+    )
+
+    # KeyUsage: только digitalSignature, критическое
+    builder = builder.add_extension(
+        x509.KeyUsage(
+            digital_signature=True,
+            content_commitment=False,
+            key_encipherment=False,
+            data_encipherment=False,
+            key_agreement=False,
+            key_cert_sign=False,
+            crl_sign=False,
+            encipher_only=False,
+            decipher_only=False,
+        ),
+        critical=True,
+    )
+
+    # ExtendedKeyUsage: id-kp-OCSPSigning
+    builder = builder.add_extension(
+        x509.ExtendedKeyUsage([OCSP_SIGNING_OID]),
+        critical=False,
+    )
+
+    # SAN (если указан)
+    san_ext = build_san_extension(san_entries)
+    if san_ext is not None:
+        builder = builder.add_extension(san_ext, critical=False)
+
+    # SKI
+    ski = x509.SubjectKeyIdentifier.from_public_key(ocsp_public_key)
+    builder = builder.add_extension(ski, critical=False)
+
+    # AKI из SKI CA
+    try:
+        ca_ski_ext = ca_cert.extensions.get_extension_for_oid(
+            ExtensionOID.SUBJECT_KEY_IDENTIFIER
+        )
+        aki = x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(
+            ca_ski_ext.value
+        )
+        builder = builder.add_extension(aki, critical=False)
+    except x509.ExtensionNotFound:
+        pass
+
+    return builder.sign(private_key=ca_private_key, algorithm=signing_hash)
