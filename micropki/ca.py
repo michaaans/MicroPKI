@@ -53,6 +53,7 @@ from micropki.repository import (
 )
 from micropki.serial import generate_unique_serial, serial_to_hex, is_valid_hex
 
+from micropki.revocation_check import RevocationStatus
 
 def validate_init_args(args) -> list[str]:
     """Валидация аргументов для ca init."""
@@ -444,6 +445,101 @@ def issue_leaf_cert(ca_cert_path, ca_key_path, ca_pass_file, template_name,
                 ba[i] = 0
 
 
+def issue_leaf_from_csr(
+    ca_cert_path, ca_key_path, ca_pass_file, template_name,
+    csr_path, out_dir, validity_days, logger, db_path=None,
+):
+    """
+    Выпуск конечного сертификата из внешнего CSR (CA-1).
+
+    - Открытый ключ берётся из CSR.
+    - Субъект берётся из CSR.
+    - SAN берётся из расширения SAN в CSR.
+    - Подпись CSR проверяется.
+
+    :param csr_path: путь к файлу CSR (PEM)
+    """
+    ca_passphrase: bytes = b""
+    try:
+        logger.info("Чтение парольной фразы УЦ (режим CSR)")
+        ca_passphrase = read_passphrase(ca_pass_file)
+        ca_cert = load_certificate(ca_cert_path)
+        ca_private_key = load_encrypted_private_key(ca_key_path, ca_passphrase)
+
+        # Загружаем и проверяем CSR
+        from cryptography import x509 as _x509
+        csr_pem = csr_path.read_bytes()
+        try:
+            csr = _x509.load_pem_x509_csr(csr_pem)
+        except Exception as e:
+            raise ValueError(f"Не удалось загрузить CSR: {e}")
+
+        try:
+            from micropki.csr import verify_csr_signature
+            verify_csr_signature(csr)
+        except Exception as e:
+            raise ValueError(f"Подпись CSR недействительна: {e}")
+
+        logger.info(
+            "CSR загружен и проверен: subject=%s", csr.subject.rfc4514_string()
+        )
+
+        from micropki.templates import get_template
+        from micropki.certificates import (
+            build_leaf_certificate_from_csr,
+            serialize_certificate_pem,
+        )
+
+        template = get_template(template_name)
+
+        if db_path and check_schema(db_path):
+            serial_number = generate_unique_serial(db_path)
+        else:
+            serial_number = None
+
+        logger.info(
+            "Выпуск сертификата из CSR: шаблон=%s, subject=%s",
+            template_name, csr.subject.rfc4514_string(),
+        )
+
+        leaf_cert = build_leaf_certificate_from_csr(
+            csr=csr,
+            ca_private_key=ca_private_key,
+            ca_cert=ca_cert,
+            template=template,
+            validity_days=validity_days,
+            serial_number=serial_number,
+        )
+
+        cert_pem = serialize_certificate_pem(leaf_cert)
+        _save_cert_to_db(db_path, leaf_cert, cert_pem, logger)
+
+        # Имя файла из CN субъекта (из CSR)
+        subject_name = leaf_cert.subject
+        cn = get_cn_from_subject(subject_name)
+        safe_name = sanitize_filename(cn)
+        cert_filename = f"{safe_name}.cert.pem"
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cert_path = out_dir / cert_filename
+        cert_path.write_bytes(cert_pem)
+        logger.info("Сертификат (из CSR) сохранён: %s", cert_path.resolve())
+
+        serial_hex = serial_to_hex(leaf_cert.serial_number)
+        logger.info(
+            "Аудит: serial=%s, subject=%s, template=%s, source=csr",
+            serial_hex, csr.subject.rfc4514_string(), template_name,
+        )
+
+        print(f"Сертификат выпущен из CSR: {cert_path}")
+
+    finally:
+        if ca_passphrase:
+            ba = bytearray(ca_passphrase)
+            for i in range(len(ba)):
+                ba[i] = 0
+
+
 def issue_ocsp_cert(
     ca_cert_path, ca_key_path, ca_pass_file, subject,
     san_strings, key_type, key_size, out_dir, validity_days,
@@ -702,6 +798,113 @@ def main() -> None:
                 print(f"Ошибка: {e}", file=sys.stderr)
                 sys.exit(1)
 
+    elif args.command == "client":
+        if getattr(args, "client_action", None) is None:
+            parser.parse_args(["client", "--help"])
+            sys.exit(1)
+
+        from micropki.client import (
+            gen_csr,
+            request_cert,
+            validate,
+            check_status,
+        )
+        import datetime
+
+        log_file = getattr(args, "log_file", None)
+
+        if args.client_action == "gen-csr":
+            # Размер ключа по умолчанию
+            if args.key_size is None:
+                args.key_size = 2048 if args.key_type == "rsa" else 256
+            try:
+                gen_csr(
+                    subject=args.subject,
+                    san_strings=args.san,
+                    key_type=args.key_type,
+                    key_size=args.key_size,
+                    out_key=args.out_key,
+                    out_csr=args.out_csr,
+                    log_file=log_file,
+                )
+            except Exception as e:
+                print(f"Ошибка: {e}", file=sys.stderr)
+                sys.exit(1)
+
+        elif args.client_action == "request-cert":
+            try:
+                request_cert(
+                    csr_path=args.csr,
+                    template=args.template,
+                    ca_url=args.ca_url,
+                    out_cert=args.out_cert,
+                    api_key=args.api_key,
+                    log_file=log_file,
+                )
+            except Exception as e:
+                print(f"Ошибка: {e}", file=sys.stderr)
+                sys.exit(1)
+
+        elif args.client_action == "validate":
+            # Парсинг validation-time
+            vt = None
+            if getattr(args, "validation_time", None):
+                try:
+                    vt = datetime.datetime.fromisoformat(
+                        args.validation_time.replace("Z", "+00:00")
+                    )
+                except ValueError as e:
+                    print(f"Ошибка: неверный формат --validation-time: {e}",
+                          file=sys.stderr)
+                    sys.exit(1)
+
+            # --ocsp без значения: пустая строка → автоматически из AIA
+            ocsp_url = getattr(args, "ocsp_url", None)
+            if ocsp_url == "":
+                ocsp_url = None  # None = автоматически из AIA
+
+            result = validate(
+                cert_path=args.cert,
+                untrusted_paths=args.untrusted,
+                trusted_path=args.trusted,
+                crl_source=args.crl,
+                ocsp_url=ocsp_url,
+                mode=args.mode,
+                validation_time=vt,
+                log_file=log_file,
+            )
+
+            print(result.summary())
+            sys.exit(0 if result.success else 1)
+
+        elif args.client_action == "check-status":
+            result = check_status(
+                cert_path=args.cert,
+                ca_cert_path=args.ca_cert,
+                crl_source=args.crl,
+                ocsp_url=args.ocsp_url,
+                log_file=log_file,
+            )
+
+            # Вывод результата
+            print(f"Статус: {result.status.value}")
+            print(f"Метод:  {result.method}")
+            if result.fallback_used:
+                print("Использован fallback: OCSP → CRL")
+            if result.reason:
+                print(f"Причина отзыва: {result.reason}")
+            if result.revocation_time:
+                print(f"Дата отзыва:    {result.revocation_time}")
+            print(f"Детали: {result.message}")
+
+            # Код завершения: 0=good, 1=revoked/error, 2=unknown
+            if result.status == RevocationStatus.GOOD:
+                sys.exit(0)
+            elif result.status == RevocationStatus.REVOKED:
+                sys.exit(1)
+            else:
+                sys.exit(2)
+
     elif args.command == "ca":
         if getattr(args, "ca_action", None) is None:
             parser.parse_args(["ca", "--help"])
@@ -755,27 +958,121 @@ def main() -> None:
                 sys.exit(1)
 
         elif args.ca_action == "issue-cert":
-            errors = validate_issue_cert_args(args)
-            if errors:
-                for err in errors:
-                    logger.error("Ошибка валидации: %s", err)
-                    print(f"Ошибка: {err}", file=sys.stderr)
-                sys.exit(1)
-            try:
-                issue_leaf_cert(
-                    ca_cert_path=args.ca_cert, ca_key_path=args.ca_key,
-                    ca_pass_file=args.ca_pass_file, template_name=args.template,
-                    subject=args.subject, san_strings=args.san,
-                    key_type=args.key_type, key_size=args.key_size,
-                    out_dir=args.out_dir, validity_days=args.validity_days,
-                    logger=logger, db_path=args.db_path,
-                )
-            except SystemExit:
-                raise
-            except Exception as e:
-                logger.error("Ошибка: %s", e)
-                print(f"Ошибка: {e}", file=sys.stderr)
-                sys.exit(1)
+
+            # CA-1: если указан --csr, используем режим CSR
+
+            if getattr(args, "csr", None) is not None:
+
+                # Валидация для режима CSR
+
+                errors = []
+
+                errors.extend(_validate_file_exists(args.ca_cert, "--ca-cert"))
+
+                errors.extend(_validate_file_exists(args.ca_key, "--ca-key"))
+
+                errors.extend(_validate_passphrase_file(args.ca_pass_file))
+
+                errors.extend(_validate_file_exists(args.csr, "--csr"))
+
+                errors.extend(_validate_positive_int(args.validity_days, "--validity-days"))
+
+                errors.extend(_validate_out_dir(args.out_dir))
+
+                if errors:
+
+                    for err in errors:
+                        logger.error("Ошибка валидации: %s", err)
+
+                        print(f"Ошибка: {err}", file=sys.stderr)
+
+                    sys.exit(1)
+
+                try:
+
+                    issue_leaf_from_csr(
+
+                        ca_cert_path=args.ca_cert,
+
+                        ca_key_path=args.ca_key,
+
+                        ca_pass_file=args.ca_pass_file,
+
+                        template_name=args.template,
+
+                        csr_path=args.csr,
+
+                        out_dir=args.out_dir,
+
+                        validity_days=args.validity_days,
+
+                        logger=logger,
+
+                        db_path=args.db_path,
+
+                    )
+
+                except SystemExit:
+
+                    raise
+
+                except Exception as e:
+
+                    logger.error("Ошибка выпуска из CSR: %s", e)
+
+                    print(f"Ошибка: {e}", file=sys.stderr)
+
+                    sys.exit(1)
+
+            else:
+
+                # Обычный режим (генерация ключа)
+
+                if not args.subject:
+                    print("Ошибка: --subject обязателен если --csr не указан.", file=sys.stderr)
+
+                    sys.exit(1)
+
+                errors = validate_issue_cert_args(args)
+
+                if errors:
+
+                    for err in errors:
+                        logger.error("Ошибка валидации: %s", err)
+
+                        print(f"Ошибка: {err}", file=sys.stderr)
+
+                    sys.exit(1)
+
+                try:
+
+                    issue_leaf_cert(
+
+                        ca_cert_path=args.ca_cert, ca_key_path=args.ca_key,
+
+                        ca_pass_file=args.ca_pass_file, template_name=args.template,
+
+                        subject=args.subject, san_strings=args.san,
+
+                        key_type=args.key_type, key_size=args.key_size,
+
+                        out_dir=args.out_dir, validity_days=args.validity_days,
+
+                        logger=logger, db_path=args.db_path,
+
+                    )
+
+                except SystemExit:
+
+                    raise
+
+                except Exception as e:
+
+                    logger.error("Ошибка: %s", e)
+
+                    print(f"Ошибка: {e}", file=sys.stderr)
+
+                    sys.exit(1)
 
         elif args.ca_action == "issue-ocsp-cert":
             if args.key_size is None:

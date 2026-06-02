@@ -4,12 +4,15 @@
 Содержит:
 - генерацию CSR для промежуточного УЦ
 - парсинг и валидацию CSR
+- проверку подписи CSR
 """
 
 from cryptography import x509
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
-from cryptography.hazmat.primitives.asymmetric import rsa, ec
+from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding
+from cryptography.hazmat.primitives.asymmetric.ec import ECDSA
+from cryptography.exceptions import InvalidSignature
 
 
 def build_intermediate_csr(
@@ -20,9 +23,6 @@ def build_intermediate_csr(
 ) -> x509.CertificateSigningRequest:
     """
     Создаёт CSR (PKCS#10) для промежуточного удостоверяющего центра.
-
-    CSR подписывается закрытым ключом промежуточного CA
-    (доказательство владения ключом).
 
     :param private_key: закрытый ключ промежуточного CA
     :param subject: DN субъекта промежуточного CA
@@ -42,7 +42,6 @@ def build_intermediate_csr(
         .subject_name(subject)
     )
 
-    # Добавляем BasicConstraints в CSR как запрошенное расширение
     builder = builder.add_extension(
         x509.BasicConstraints(ca=True, path_length=path_length),
         critical=True,
@@ -63,5 +62,39 @@ def serialize_csr_pem(csr: x509.CertificateSigningRequest) -> bytes:
     :param csr: объект CSR
     :return: байты PEM-файла
     """
-    from cryptography.hazmat.primitives import serialization
     return csr.public_bytes(serialization.Encoding.PEM)
+
+
+def verify_csr_signature(csr: x509.CertificateSigningRequest) -> bool:
+    """
+    Проверяет самоподпись CSR (proof-of-possession).
+
+    Работает со всеми версиями cryptography >= 38.
+
+    :param csr: объект CSR
+    :return: True если подпись верна
+    :raises ValueError: если подпись неверна или тип ключа не поддерживается
+    """
+    pub = csr.public_key()
+    try:
+        if isinstance(pub, rsa.RSAPublicKey):
+            pub.verify(
+                csr.signature,
+                csr.tbs_certrequest_bytes,
+                padding.PKCS1v15(),
+                csr.signature_hash_algorithm,
+            )
+        elif isinstance(pub, ec.EllipticCurvePublicKey):
+            pub.verify(
+                csr.signature,
+                csr.tbs_certrequest_bytes,
+                ECDSA(csr.signature_hash_algorithm),
+            )
+        else:
+            raise ValueError(
+                f"Неподдерживаемый тип ключа в CSR: {type(pub)}"
+            )
+    except InvalidSignature as e:
+        raise ValueError(f"Подпись CSR недействительна: {e}") from e
+
+    return True

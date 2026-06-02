@@ -17,7 +17,7 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID, ExtensionOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
-
+from cryptography.hazmat.primitives.asymmetric import rsa as rsa_mod, ec as ec_mod
 from micropki.templates import CertificateTemplate, build_key_usage
 
 # Маппинг коротких имён атрибутов DN → OID
@@ -542,6 +542,131 @@ def build_ocsp_cert(
     builder = builder.add_extension(ski, critical=False)
 
     # AKI из SKI CA
+    try:
+        ca_ski_ext = ca_cert.extensions.get_extension_for_oid(
+            ExtensionOID.SUBJECT_KEY_IDENTIFIER
+        )
+        aki = x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(
+            ca_ski_ext.value
+        )
+        builder = builder.add_extension(aki, critical=False)
+    except x509.ExtensionNotFound:
+        pass
+
+    return builder.sign(private_key=ca_private_key, algorithm=signing_hash)
+
+
+def build_leaf_certificate_from_csr(
+    csr: x509.CertificateSigningRequest,
+    ca_private_key: PrivateKeyTypes,
+    ca_cert: x509.Certificate,
+    template,
+    validity_days: int,
+    serial_number: int | None = None,
+    override_san: list[tuple[str, str]] | None = None,
+) -> x509.Certificate:
+    """
+    Строит конечный сертификат на основе внешнего CSR (CA-1).
+
+    - Открытый ключ берётся из CSR.
+    - Субъект берётся из CSR.
+    - SAN берётся из CSR (если присутствует), иначе из override_san.
+    - Подпись CSR обязательно проверяется перед выпуском.
+
+    :param csr: внешний CSR (PKCS#10)
+    :param ca_private_key: закрытый ключ CA
+    :param ca_cert: сертификат CA
+    :param template: шаблон сертификата
+    :param validity_days: срок действия
+    :param serial_number: серийный номер (None → случайный)
+    :param override_san: SAN если в CSR нет SAN
+    :return: подписанный сертификат
+    :raises ValueError: если подпись CSR неверна или CSR содержит CA=True
+    """
+    from micropki.templates import build_key_usage
+    from micropki.csr import verify_csr_signature
+
+    # Проверяем подпись CSR (CA-1)
+    verify_csr_signature(csr)
+
+    # Определяем тип ключа из CSR
+    csr_pub = csr.public_key()
+    if isinstance(csr_pub, rsa_mod.RSAPublicKey):
+        leaf_key_type = "rsa"
+    elif isinstance(csr_pub, ec_mod.EllipticCurvePublicKey):
+        leaf_key_type = "ecc"
+    else:
+        raise ValueError(f"Неподдерживаемый тип ключа в CSR: {type(csr_pub)}")
+
+    ca_key_type = _detect_key_type(ca_private_key)
+    signing_hash = _get_signing_hash(ca_key_type)
+
+    if serial_number is None:
+        serial_number = _generate_serial_number()
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    not_after = now + datetime.timedelta(days=validity_days)
+
+    # Проверка CA=True в CSR — запрещаем (TEST-50)
+    try:
+        bc_in_csr = csr.extensions.get_extension_for_oid(
+            ExtensionOID.BASIC_CONSTRAINTS
+        )
+        if bc_in_csr.value.ca:
+            raise ValueError(
+                "CSR запрашивает CA=True, но выпуск CA-сертификатов "
+                "через этот эндпоинт запрещён политикой."
+            )
+    except x509.ExtensionNotFound:
+        pass
+
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(csr.subject)
+        .issuer_name(ca_cert.subject)
+        .public_key(csr_pub)
+        .serial_number(serial_number)
+        .not_valid_before(now)
+        .not_valid_after(not_after)
+    )
+
+    # BasicConstraints: CA=FALSE, критическое
+    builder = builder.add_extension(
+        x509.BasicConstraints(ca=False, path_length=None),
+        critical=True,
+    )
+
+    # KeyUsage по шаблону
+    key_usage = build_key_usage(template, leaf_key_type)
+    builder = builder.add_extension(key_usage, critical=True)
+
+    # Extended Key Usage
+    builder = builder.add_extension(
+        x509.ExtendedKeyUsage(template.extended_key_usages),
+        critical=False,
+    )
+
+    # SAN: сначала из CSR, потом из override_san
+    san_ext_obj = None
+    try:
+        san_in_csr = csr.extensions.get_extension_for_oid(
+            ExtensionOID.SUBJECT_ALTERNATIVE_NAME
+        )
+        san_ext_obj = san_in_csr.value
+    except x509.ExtensionNotFound:
+        pass
+
+    if san_ext_obj is None and override_san:
+        san_ext_obj = build_san_extension(override_san)
+
+    if san_ext_obj is not None:
+        builder = builder.add_extension(san_ext_obj, critical=False)
+
+    # SKI
+    ski = x509.SubjectKeyIdentifier.from_public_key(csr_pub)
+    builder = builder.add_extension(ski, critical=False)
+
+    # AKI из CA
     try:
         ca_ski_ext = ca_cert.extensions.get_extension_for_oid(
             ExtensionOID.SUBJECT_KEY_IDENTIFIER

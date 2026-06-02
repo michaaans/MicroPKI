@@ -2,9 +2,10 @@
 HTTP-сервер репозитория сертификатов (FastAPI).
 
 Эндпоинты:
-  GET /certificate/{serial_hex} — получить сертификат по серийному номеру
-  GET /ca/{level}               — получить сертификат УЦ (root / intermediate)
-  GET /crl                      — получить CRL
+  GET  /certificate/{serial_hex} — получить сертификат по серийному номеру
+  GET  /ca/{level}               — получить сертификат УЦ (root / intermediate)
+  GET  /crl                      — получить CRL
+  POST /request-cert             — выпустить сертификат по CSR (REPO-15)
 """
 
 import os
@@ -14,16 +15,49 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi import FastAPI, HTTPException, Request, Query, Header
 from fastapi.responses import PlainTextResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+
+from cryptography import x509
+from cryptography.x509.oid import ExtensionOID
 
 from micropki.database import check_schema
 from micropki.repository import get_certificate_by_serial
 from micropki.serial import is_valid_hex
+from micropki.csr import verify_csr_signature
 
 logger = logging.getLogger("micropki")
 http_logger = logging.getLogger("micropki.http")
+
+# REPO-16: API-ключ из переменной окружения или значение по умолчанию
+# ВНИМАНИЕ: значение по умолчанию небезопасно — только для демонстрации!
+_DEFAULT_API_KEY = "changeme"
+_API_KEY_WARNING_SHOWN = False
+
+
+def _get_api_key() -> str:
+    return os.environ.get("MICROPKI_API_KEY", _DEFAULT_API_KEY)
+
+
+def _check_api_key(provided: str | None) -> bool:
+    """
+    Проверяет API-ключ.
+    Если переменная MICROPKI_API_KEY не задана — аутентификация отключена
+    с предупреждением в лог.
+    """
+    global _API_KEY_WARNING_SHOWN
+    configured = os.environ.get("MICROPKI_API_KEY")
+    if configured is None:
+        if not _API_KEY_WARNING_SHOWN:
+            logger.warning(
+                "БЕЗОПАСНОСТЬ: Переменная MICROPKI_API_KEY не задана. "
+                "Эндпоинт /request-cert работает БЕЗ аутентификации. "
+                "В production задайте MICROPKI_API_KEY."
+            )
+            _API_KEY_WARNING_SHOWN = True
+        return True  # аутентификация отключена
+    return provided == configured
 
 
 def create_app(db_path: str, cert_dir: str) -> FastAPI:
@@ -37,7 +71,6 @@ def create_app(db_path: str, cert_dir: str) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        """Управление жизненным циклом приложения."""
         logger.info("Сервер репозитория запущен (db=%s, certs=%s)", db_path, cert_dir)
         yield
         logger.info("Сервер репозитория остановлен")
@@ -51,7 +84,7 @@ def create_app(db_path: str, cert_dir: str) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_methods=["GET"],
+        allow_methods=["GET", "POST"],
         allow_headers=["*"],
     )
 
@@ -60,7 +93,6 @@ def create_app(db_path: str, cert_dir: str) -> FastAPI:
 
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
-        """Логирование каждого HTTP-запроса."""
         response = await call_next(request)
         client_ip = request.client.host if request.client else "unknown"
         http_logger.info(
@@ -105,12 +137,7 @@ def create_app(db_path: str, cert_dir: str) -> FastAPI:
 
     @app.get("/crl")
     async def get_crl(ca: str = Query(default="intermediate", pattern="^(root|intermediate)$")):
-        """
-        Получить CRL.
-
-        Параметр запроса ?ca=root или ?ca=intermediate (по умолчанию intermediate).
-        """
-
+        """Получить CRL."""
         certs_path = Path(cert_dir)
         crl_dir = certs_path.parent / "crl"
         crl_file = crl_dir / f"{ca}.crl.pem"
@@ -118,12 +145,10 @@ def create_app(db_path: str, cert_dir: str) -> FastAPI:
         if not crl_file.exists():
             raise HTTPException(
                 status_code=404,
-                detail=f"CRL для '{ca}' не найден. Сгенерируйте его командой 'micropki ca gen-crl --ca {ca}'.",
+                detail=f"CRL для '{ca}' не найден.",
             )
 
         crl_content = crl_file.read_bytes()
-
-        # Заголовки кэширования
         stat = crl_file.stat()
         etag = hashlib.md5(crl_content).hexdigest()
 
@@ -137,18 +162,190 @@ def create_app(db_path: str, cert_dir: str) -> FastAPI:
             },
         )
 
+    @app.post("/request-cert", status_code=201)
+    async def request_cert_endpoint(
+        request: Request,
+        template: str = Query(..., description="Шаблон: server, client, code_signing"),
+        x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    ):
+        """
+        Выпустить сертификат по CSR (REPO-15).
+
+        Принимает CSR в формате PEM (Content-Type: application/x-pem-file).
+        Возвращает подписанный сертификат в PEM.
+
+        БЕЗОПАСНОСТЬ (REPO-16): Аутентификация через заголовок X-API-Key.
+        Если переменная окружения MICROPKI_API_KEY не задана —
+        аутентификация ОТКЛЮЧЕНА (только для демонстрации, небезопасно!).
+        """
+        # Аутентификация (REPO-16)
+        if not _check_api_key(x_api_key):
+            raise HTTPException(
+                status_code=401,
+                detail="Неверный или отсутствующий API-ключ (X-API-Key).",
+            )
+
+        # Валидация шаблона
+        allowed_templates = {"server", "client", "code_signing"}
+        if template not in allowed_templates:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Недопустимый шаблон: '{template}'. Допустимые: {sorted(allowed_templates)}",
+            )
+
+        # Читаем тело запроса (CSR PEM)
+        body = await request.body()
+        if not body:
+            raise HTTPException(status_code=400, detail="Тело запроса пустое.")
+
+        # Парсим CSR
+        try:
+            csr = x509.load_pem_x509_csr(body)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Некорректный CSR: {e}",
+            )
+
+        # Проверяем подпись CSR
+        try:
+            verify_csr_signature(csr)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Подпись CSR недействительна: {e}",
+            )
+
+        # Получаем CA-материалы из cert_dir
+        ca_cert_path = Path(cert_dir) / "intermediate.cert.pem"
+        ca_key_path_candidates = [
+            Path(cert_dir).parent / "private" / "intermediate.key.pem",
+        ]
+
+        if not ca_cert_path.exists():
+            raise HTTPException(
+                status_code=500,
+                detail="Сертификат промежуточного CA не найден на сервере.",
+            )
+
+        ca_key_path = None
+        for p in ca_key_path_candidates:
+            if p.exists():
+                ca_key_path = p
+                break
+
+        if ca_key_path is None:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Ключ промежуточного CA не найден. "
+                    "Убедитесь что файл доступен серверу."
+                ),
+            )
+
+        # Читаем ключ CA (ключ должен быть без шифрования для сервера)
+        try:
+            from cryptography.hazmat.primitives import serialization as _serial
+            ca_key_pem = ca_key_path.read_bytes()
+            ca_private_key = _serial.load_pem_private_key(ca_key_pem, password=None)
+        except Exception:
+            # Пробуем с паролем из переменной окружения
+            ca_pass = os.environ.get("MICROPKI_CA_PASS", "").encode()
+            if not ca_pass:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Не удалось загрузить ключ CA. "
+                        "Задайте MICROPKI_CA_PASS или используйте незашифрованный ключ."
+                    ),
+                )
+            try:
+                from cryptography.hazmat.primitives import serialization as _serial2
+                ca_key_pem = ca_key_path.read_bytes()
+                ca_private_key = _serial2.load_pem_private_key(ca_key_pem, password=ca_pass)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Не удалось расшифровать ключ CA: {e}",
+                )
+
+        ca_cert = x509.load_pem_x509_certificate(ca_cert_path.read_bytes())
+
+        # Выпускаем сертификат
+        try:
+            from micropki.templates import get_template
+            from micropki.certificates import build_leaf_certificate_from_csr
+            from micropki.certificates import serialize_certificate_pem
+            from micropki.serial import generate_unique_serial
+            from micropki.database import check_schema as _check_schema
+            from micropki.repository import insert_certificate
+            from micropki.serial import serial_to_hex
+
+            tmpl = get_template(template)
+
+            if check_schema(db_path):
+                serial_number = generate_unique_serial(db_path)
+            else:
+                serial_number = None
+
+            cert = build_leaf_certificate_from_csr(
+                csr=csr,
+                ca_private_key=ca_private_key,
+                ca_cert=ca_cert,
+                template=tmpl,
+                validity_days=365,
+                serial_number=serial_number,
+            )
+
+            cert_pem = serialize_certificate_pem(cert)
+
+            # Сохраняем в БД
+            if check_schema(db_path):
+                def _dn(name):
+                    parts = []
+                    for attr in name:
+                        parts.append(f"{attr.oid._name}={attr.value}")
+                    return ", ".join(parts)
+
+                s_hex = serial_to_hex(cert.serial_number)
+                insert_certificate(
+                    db_path=db_path,
+                    serial_hex=s_hex,
+                    subject=_dn(cert.subject),
+                    issuer=_dn(cert.issuer),
+                    not_before=cert.not_valid_before_utc,
+                    not_after=cert.not_valid_after_utc,
+                    cert_pem=cert_pem.decode("utf-8"),
+                )
+
+                # LOG-16: аудит API-запросов
+                client_ip = request.client.host if request.client else "unknown"
+                logger.info(
+                    "AUDIT /request-cert: serial=%s subject=%s template=%s "
+                    "client_ip=%s via_api=True",
+                    s_hex, _dn(cert.subject), template, client_ip,
+                )
+
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.error("Ошибка выпуска сертификата через API: %s", e)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Внутренняя ошибка при выпуске сертификата: {e}",
+            )
+
+        return Response(
+            content=cert_pem,
+            status_code=201,
+            media_type="application/x-pem-file",
+        )
+
     return app
 
 
 def run_server(host: str, port: int, db_path: str, cert_dir: str) -> None:
-    """
-    Запускает HTTP-сервер репозитория.
-
-    :param host: адрес привязки
-    :param port: TCP-порт
-    :param db_path: путь к БД
-    :param cert_dir: каталог с сертификатами
-    """
+    """Запускает HTTP-сервер репозитория."""
     if not check_schema(db_path):
         logger.error("БД не инициализирована: %s", db_path)
         raise RuntimeError("База данных не инициализирована")

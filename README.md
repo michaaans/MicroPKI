@@ -371,6 +371,93 @@ Nonce (одноразовое число) в OCSP — расширение с OI
 **Почему это важно**:
 - Без nonce злоумышленник может перехватить старый OCSP-ответ (например, со статусом good) и предъявить его позже, даже если сертификат уже отозван. Nonce делает каждый ответ уникальным и привязанным к конкретному запросу.
 
+# Команда client gen-csr
+Генерирует закрытый ключ и CSR:
+```bash
+micropki client gen-csr \
+    --subject "CN=myapp.local,O=MyOrg" \
+    --key-type rsa \
+    --key-size 2048 \
+    --san dns:myapp.local \
+    --san dns:www.myapp.local \
+    --out-key ./myapp.key.pem \
+    --out-csr ./myapp.csr.pem
+ ```
+Параметры:
+- --subject — DN субъекта (обязательно)
+- --key-type — rsa или ecc (по умолч.: rsa)
+- --key-size — 2048/4096 для RSA, 256/384 для ECC
+- --san — SAN записи (повторяемый флаг)
+- --out-key — файл ключа (по умолч.: ./key.pem)
+- --out-csr — файл CSR (по умолч.: ./request.csr.pem)
+
+# Команда client request-cert
+Отправляет CSR в сервер и получает подписанный сертификат:
+```bash
+micropki client request-cert \
+    --csr ./myapp.csr.pem \
+    --template server \
+    --ca-url http://localhost:8080 \
+    --out-cert ./myapp.cert.pem
+```
+Параметры:
+- --csr — путь к CSR (обязательно)
+- --template — шаблон: server, client, code_signing
+- --ca-url — URL сервера репозитория
+- --out-cert — файл для сертификата
+- --api-key — API-ключ (если MICROPKI_API_KEY задан на сервере)
+
+# Команда client validate
+Проверяет цепочку сертификатов:
+```bash
+# Только цепочка (без проверки отзыва)
+micropki client validate \
+    --cert ./myapp.cert.pem \
+    --untrusted pki/certs/intermediate.cert.pem \
+    --trusted pki/certs/ca.cert.pem \
+    --mode chain
+
+# Полная проверка с CRL
+micropki client validate \
+    --cert ./myapp.cert.pem \
+    --untrusted pki/certs/intermediate.cert.pem \
+    --trusted pki/certs/ca.cert.pem \
+    --mode full \
+    --crl pki/crl/intermediate.crl.pem
+
+# Полная проверка с OCSP (автоматически из AIA, или явный URL)
+micropki client validate \
+    --cert ./myapp.cert.pem \
+    --untrusted pki/certs/intermediate.cert.pem \
+    --trusted pki/certs/ca.cert.pem \
+    --mode full \
+    --ocsp http://127.0.0.1:8081/ocsp
+    
+# Коды завершения: 0 = успех, 1 = ошибка
+```
+
+# Команда client check-status
+Проверяет статус отзыва (OCSP → CRL fallback):
+```bash
+# Автоматически OCSP из AIA сертификата, при неудаче — CRL
+micropki client check-status \
+    --cert ./myapp.cert.pem \
+    --ca-cert pki/certs/intermediate.cert.pem
+
+# Явный OCSP URL
+micropki client check-status \
+    --cert ./myapp.cert.pem \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ocsp-url http://127.0.0.1:8081/ocsp
+
+# Только CRL
+micropki client check-status \
+    --cert ./myapp.cert.pem \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --crl pki/crl/intermediate.crl.pem
+    
+# Коды завершения: 0 = good, 1 = revoked, 2 = unknown
+```
 
 ## Тестирование
 ### TEST-1
@@ -1317,7 +1404,6 @@ openssl ocsp \
 #   /tmp/foreign.cert.pem: unknown
 ```
 
-
 ### TEST-37
 ```bash
 # Выпустить новый сертификат
@@ -1398,6 +1484,492 @@ openssl ocsp \
 #         Revocation Time: Apr  6 11:52:38 2026 GMT
 ```
 
+### TEST-38
+```bash
+# Сгенерировать RSA-ключ и CSR
+micropki client gen-csr \
+    --subject "CN=app.example.com,O=MicroPKI" \
+    --key-type rsa \
+    --key-size 2048 \
+    --san dns:app.example.com \
+    --san dns:api.example.com \
+    --out-key ./app.key.pem \
+    --out-csr ./app.csr.pem
+
+# Ожидаемый вывод (stderr):
+# ПРЕДУПРЕЖДЕНИЕ: Закрытый ключ сохранён БЕЗ шифрования!
+#   Файл: app.key.pem
+#   Защитите файл от несанкционированного доступа.
+#
+# Ожидаемый вывод (stdout):
+# Закрытый ключ: app.key.pem
+# CSR:           app.csr.pem
+
+# Проверить ключ — должен быть незашифрованным
+openssl pkey -in app.key.pem -noout
+# Ожидаемый вывод: команда завершается без запроса пароля
+
+# Проверить CSR — субъект и SAN
+openssl req -in app.csr.pem -text -noout
+# Ожидаемый вывод (фрагмент):
+# Subject: CN=app.example.com, O=MicroPKI
+# X509v3 Subject Alternative Name:
+#     DNS:app.example.com, DNS:api.example.com
+
+# Проверить подпись CSR
+openssl req -in app.csr.pem -verify -noout
+# Ожидаемый вывод: Certificate request self-signature verify OK
+
+# Проверить права на ключ (Linux/macOS)
+ls -la app.key.pem
+# Ожидаемый вывод: -rw------- (600)
+
+# Сгенерировать ECC CSR
+micropki client gen-csr \
+    --subject "CN=ecc.example.com" \
+    --key-type ecc \
+    --key-size 256 \
+    --san dns:ecc.example.com \
+    --out-key ./ecc.key.pem \
+    --out-csr ./ecc.csr.pem
+
+openssl req -in ecc.csr.pem -text -noout | grep "Public Key Algorithm"
+# Ожидаемый вывод: Public Key Algorithm: id-ecPublicKey
+```
+
+### TEST-39
+```bash
+# Предварительно: запустить сервер (в отдельном терминале)
+MICROPKI_CA_PASS="$(cat secrets/intermediate.pass)" micropki repo serve --host 127.0.0.1 --port 8080
+
+# Сгенерировать CSR (если ещё не сделано)
+micropki client gen-csr \
+    --subject "CN=app.example.com,O=MicroPKI" \
+    --key-type rsa \
+    --key-size 2048 \
+    --san dns:app.example.com \
+    --out-key ./app.key.pem \
+    --out-csr ./app.csr.pem
+
+# Запросить сертификат через API
+micropki client request-cert \
+    --csr ./app.csr.pem \
+    --template server \
+    --ca-url http://localhost:8080 \
+    --out-cert ./app.cert.pem
+
+# Ожидаемый вывод:
+# Сертификат сохранён: app.cert.pem
+
+# Проверить сертификат
+openssl x509 -in app.cert.pem -text -noout
+# Ожидаемый вывод (фрагмент):
+# Subject: CN=app.example.com, O=MicroPKI
+# X509v3 Subject Alternative Name:
+#     DNS:app.example.com
+# X509v3 Basic Constraints: critical
+#     CA:FALSE
+# X509v3 Extended Key Usage:
+#     TLS Web Server Authentication
+
+# Проверить что CN из CSR совпадает с CN в сертификате
+openssl req -in app.csr.pem -noout -subject
+openssl x509 -in app.cert.pem -noout -subject
+# Ожидаемый вывод: оба должны содержать CN=app.example.com
+```
+
+### TEST-40
+```bash
+# Предварительно: выпустить сертификат через API (или ca issue-cert)
+# Убедиться что есть:
+#   app.cert.pem            — конечный сертификат
+#   pki/certs/intermediate.cert.pem — промежуточный CA
+#   pki/certs/ca.cert.pem   — корневой CA
+
+micropki client validate \
+    --cert ./app.cert.pem \
+    --untrusted ./pki/certs/intermediate.cert.pem \
+    --trusted ./pki/certs/ca.cert.pem \
+    --mode chain
+
+# Ожидаемый вывод:
+# Результат проверки цепочки: УСПЕХ
+# Цепочка сертификатов:
+#   [0] CN=app.example.com,O=MicroPKI
+#   [1] CN=MicroPKI Intermediate CA,O=MicroPKI
+#   [2] CN=Demo Root CA,O=MicroPKI,C=RU
+#
+# Сертификат: CN=app.example.com,O=MicroPKI
+#   Подпись верна (подписан: CN=MicroPKI Intermediate CA,O=MicroPKI)
+#   Срок действия в норме (2026-... — 2027-...)
+#   BasicConstraints: CA=False (ожидалось CA=False)
+#   KeyUsage: digitalSignature присутствует (критичное)
+# ...
+```
+
+### TEST-41
+```bash
+# Выпустить сертификат с коротким сроком (1 день)
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=short-lived.example.com" \
+    --san dns:short-lived.example.com \
+    --validity-days 1 \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Проверить с текущим временем — должно пройти
+micropki client validate \
+    --cert pki/certs/short-lived.example.com.cert.pem \
+    --untrusted pki/certs/intermediate.cert.pem \
+    --trusted pki/certs/ca.cert.pem \
+    --mode chain
+
+# Ожидаемый вывод: Результат проверки цепочки: УСПЕХ
+
+# Проверить с временем в будущем (через 400 дней)
+# Вычислить дату (Linux):
+FUTURE=$(date -u -d "+400 days" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
+         date -u -v+400d "+%Y-%m-%dT%H:%M:%SZ")
+echo "Будущая дата: $FUTURE"
+
+micropki client validate \
+    --cert pki/certs/short-lived.example.com.cert.pem \
+    --untrusted pki/certs/intermediate.cert.pem \
+    --trusted pki/certs/ca.cert.pem \
+    --mode chain \
+    --validation-time "$FUTURE"
+
+# Ожидаемый вывод:
+# Результат проверки цепочки: ОШИБКА
+# ...
+#   Сертификат просрочен. notAfter=...
+# Ошибка в сертификате [...]: Сертификат просрочен...
+```
+
+### TEST-43
+```bash
+# Выпустить тестовый сертификат
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=crl-check.example.com" \
+    --san dns:crl-check.example.com \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Найти серийный номер
+micropki ca list-certs --status valid --format json
+# Найти serial_hex для CN=crl-check.example.com
+
+# Отозвать сертификат
+micropki ca revoke 69D39E3502A0098F --reason keyCompromise --force
+# Ожидаемый вывод: Сертификат 69D39E3502A0098F успешно отозван.
+
+# Сгенерировать CRL
+micropki ca gen-crl \
+    --ca intermediate \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass
+
+# Проверить статус через CRL (без OCSP)
+micropki client check-status \
+    --cert pki/certs/crl-check.example.com.cert.pem \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --crl pki/crl/intermediate.crl.pem
+
+# Ожидаемый вывод:
+# Статус: revoked
+# Метод:  crl
+# Причина отзыва: key_compromise
+# Дата отзыва:    2026-...
+# Детали: Сертификат отозван согласно CRL (pki/crl/intermediate.crl.pem). ...
+
+# Проверить неотозванный сертификат
+micropki client check-status \
+    --cert pki/certs/alice.cert.pem \
+    --ca-cert pki/certs/ca.cert.pem \
+    --crl pki/crl/intermediate.crl.pem
+# Ожидаемый вывод: Статус: good (или unknown если CRL не от этого CA)
+```
+
+### TEST-44
+```bash
+# Запустить OCSP-ответчик:
+micropki ocsp serve \
+    --host 127.0.0.1 \
+    --port 8081 \
+    --db-path pki/micropki.db \
+    --responder-cert pki/certs/OCSP_Responder.cert.pem \
+    --responder-key pki/certs/OCSP_Responder.key.pem \
+    --ca-cert pki/certs/intermediate.cert.pem
+
+# Проверить статус через OCSP (хороший сертификат)
+micropki client check-status \
+    --cert pki/certs/app.example.com.cert.pem \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ocsp-url http://127.0.0.1:8081/ocsp
+
+# Ожидаемый вывод:
+# Статус: good
+# Метод:  ocsp
+# Детали: OCSP (http://127.0.0.1:8081/ocsp): статус good
+
+# Отозвать сертификат
+micropki ca revoke 69D39E3502A0098F --reason superseded --force
+
+# Проверить статус снова — должен быть revoked
+micropki client check-status \
+    --cert pki/certs/app.example.com.cert.pem \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ocsp-url http://127.0.0.1:8081/ocsp
+
+# Ожидаемый вывод:
+# Статус: revoked
+# Метод:  ocsp
+# Причина отзыва: superseded
+# Дата отзыва:    2026-...
+# Детали: OCSP (...): сертификат отозван. ...
+```
+
+### TEST-45
+```bash
+# Сценарий: OCSP-ответчик НЕ запущен, CRL доступен
+
+# Убедиться что OCSP-ответчик не запущен
+#    (если запущен — остановить, Ctrl+C в терминале с ocsp serve)
+
+# Убедиться что CRL актуален
+micropki ca gen-crl \
+    --ca intermediate \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass
+
+# Выпустить новый сертификат для теста
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=fallback-test.example.com" \
+    --san dns:fallback-test.example.com \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Отозвать сертификат
+micropki ca revoke 69D39E3502A0098F --reason unspecified --force
+
+# Перегенерировать CRL (с новым отозванным сертификатом)
+micropki ca gen-crl \
+    --ca intermediate \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass
+
+# Проверить статус — OCSP недоступен, должен переключиться на CRL
+micropki client check-status \
+    --cert pki/certs/fallback-test.example.com.cert.pem \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ocsp-url http://127.0.0.1:8081/ocsp \
+    --crl pki/crl/intermediate.crl.pem
+
+# Ожидаемый вывод:
+# Статус: revoked
+# Метод:  crl
+# Использован fallback: OCSP → CRL
+# Причина отзыва: unspecified
+# Дата отзыва:    2026-...
+# Детали: [Fallback: OCSP→CRL] Сертификат отозван согласно CRL ...
+```
+
+### TEST-46
+```bash
+# Попытка без промежуточного — должна завершиться ошибкой
+micropki client validate \
+    --cert pki/certs/app.example.com.cert.pem \
+    --trusted pki/certs/ca.cert.pem \
+    --mode chain
+
+# Ожидаемый вывод:
+# Результат проверки цепочки: ОШИБКА
+# Ошибка: Не удалось построить цепочку сертификатов. 
+#          Проверьте наличие промежуточных сертификатов (--untrusted).
+
+
+# С промежуточным — должна быть успешной
+micropki client validate \
+    --cert pki/certs/app.example.com.cert.pem \
+    --untrusted pki/certs/intermediate.cert.pem \
+    --trusted pki/certs/ca.cert.pem \
+    --mode chain
+
+# Ожидаемый вывод:
+# Результат проверки цепочки: УСПЕХ
+# Цепочка сертификатов:
+#   [0] ...app.example.com...
+#   [1] ...Intermediate CA...
+#   [2] ...Root CA...
+```
+
+### TEST-48
+```bash
+# Терминал 1: запустить сервер репозитория
+MICROPKI_CA_PASS="$(cat secrets/intermediate.pass)" micropki repo serve --host 127.0.0.1 --port 8080
+
+# Терминал 2: запустить OCSP-ответчик
+micropki ocsp serve \
+    --host 127.0.0.1 \
+    --port 8081 \
+    --db-path pki/micropki.db \
+    --responder-cert pki/certs/OCSP_Responder.cert.pem \
+    --responder-key pki/certs/OCSP_Responder.key.pem \
+    --ca-cert pki/certs/intermediate.cert.pem
+
+# Сгенерировать CSR
+micropki client gen-csr \
+    --subject "CN=e2e-test.example.com,O=MicroPKI" \
+    --key-type rsa \
+    --key-size 2048 \
+    --san dns:e2e-test.example.com \
+    --out-key ./e2e.key.pem \
+    --out-csr ./e2e.csr.pem
+# Ожидаемый вывод: Закрытый ключ: e2e.key.pem / CSR: e2e.csr.pem
+
+# Запросить сертификат через API
+micropki client request-cert \
+    --csr ./e2e.csr.pem \
+    --template server \
+    --ca-url http://localhost:8080 \
+    --out-cert ./e2e.cert.pem
+# Ожидаемый вывод: Сертификат сохранён: e2e.cert.pem
+
+# Проверить цепочку (mode=chain)
+micropki client validate \
+    --cert ./e2e.cert.pem \
+    --untrusted pki/certs/intermediate.cert.pem \
+    --trusted pki/certs/ca.cert.pem \
+    --mode chain
+# Ожидаемый вывод: Результат проверки цепочки: УСПЕХ
+
+# Проверить статус через OCSP
+micropki client check-status \
+    --cert ./e2e.cert.pem \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ocsp-url http://127.0.0.1:8081/ocsp
+# Ожидаемый вывод: Статус: good
+
+# Найти серийный номер и отозвать
+micropki ca list-certs --format json
+
+micropki ca revoke 69D39E3502A0098F --reason keyCompromise --force
+# Ожидаемый вывод: Сертификат 69D39E3502A0098F успешно отозван.
+
+# Сгенерировать CRL
+micropki ca gen-crl \
+    --ca intermediate \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass
+
+# Повторная проверка через OCSP — должен быть revoked
+micropki client check-status \
+    --cert ./e2e.cert.pem \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ocsp-url http://127.0.0.1:8081/ocsp
+# Ожидаемый вывод:
+# Статус: revoked
+# Метод:  ocsp
+# Причина отзыва: key_compromise
+# Дата отзыва:    ...
+
+# Проверка через CRL
+micropki client check-status \
+    --cert ./e2e.cert.pem \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --crl pki/crl/intermediate.crl.pem
+# Ожидаемый вывод:
+# Статус: revoked
+# Метод:  crl
+# Причина отзыва: key_compromise
+
+# Полная validate с проверкой отзыва
+micropki client validate \
+    --cert ./e2e.cert.pem \
+    --untrusted pki/certs/intermediate.cert.pem \
+    --trusted pki/certs/ca.cert.pem \
+    --mode full \
+    --crl pki/crl/intermediate.crl.pem
+# Ожидаемый вывод:
+# Результат проверки цепочки: ОШИБКА
+# Ошибка: Сертификат ОТОЗВАН. ...
+```
+
+### TEST-49
+```bash
+# Сгенерировать валидный CSR
+micropki client gen-csr \
+    --subject "CN=tamper.example.com" \
+    --san dns:tamper.example.com \
+    --out-key /tmp/tamper.key.pem \
+    --out-csr /tmp/tamper.csr.pem
+
+# Испортить CSR: заменить один символ в теле PEM
+# Linux:
+python3 -c "
+import base64
+data = open('/tmp/tamper.csr.pem', 'rb').read()
+lines = data.split(b'\n')
+body = [l for l in lines if l and not l.startswith(b'-----')]
+raw = bytearray(base64.b64decode(body[2]))
+raw[20] ^= 0xFF
+body[2] = base64.b64encode(bytes(raw))
+out = b'\n'.join([b'-----BEGIN CERTIFICATE REQUEST-----'] + body + [b'-----END CERTIFICATE REQUEST-----', b''])
+open('/tmp/tampered.csr.pem', 'wb').write(out)
+print('CSR испорчен')
+"
+
+# Через CLI (ca issue-cert --csr)
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --csr /tmp/tampered.csr.pem \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+# Ожидаемый вывод: Ошибка: Подпись CSR недействительна: ...
+```
+
+### TEST-50
+```bash
+# Создать CSR с BasicConstraints CA=True (используем openssl)
+openssl req -new -newkey rsa:2048 -nodes \
+    -keyout /tmp/evil-ca.key.pem \
+    -subj "/CN=evil-ca.example.com" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -out /tmp/evil-ca.csr.pem
+
+# Попытаться выпустить через CLI
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --csr /tmp/evil-ca.csr.pem \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Ожидаемый вывод:
+# Ошибка: CSR запрашивает CA=True, но выпуск CA-сертификатов
+#          через этот эндпоинт запрещён политикой.
+```
 
 ## Структура выходных файлов
 ```text
@@ -1445,6 +2017,9 @@ MicroPKI/
 │   ├── server.py             # HTTP-сервер
 │   ├── ocsp.py               # работа с OCSP
 │   ├── ocsp_responder.py     # Сервер OCSP
+│   ├── client.py             # Клиентская логика
+│   ├── revocation_check.py   # Проверка CRL/OCSP
+│   ├── validation.py         # Проверка цепочки
 │   └── logger.py             # настройка логирования
 ├── tests/
 │   ├── test_csr.py           
