@@ -158,6 +158,16 @@ def revoke_certificate(
         )
         conn.commit()
 
+        # Аудит (AUD-4)
+        from micropki.audit import get_audit_logger
+        audit = get_audit_logger()
+        if audit:
+            audit.log_revoke(
+                serial=serial_hex,
+                subject=subject,
+                reason=normalized_reason,
+            )
+
         log.info(
             "Сертификат отозван: serial=%s, subject=%s, причина=%s, дата=%s",
             serial_hex, subject, normalized_reason, now_str,

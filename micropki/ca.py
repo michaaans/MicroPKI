@@ -55,6 +55,25 @@ from micropki.serial import generate_unique_serial, serial_to_hex, is_valid_hex
 
 from micropki.revocation_check import RevocationStatus
 
+from micropki.policy import (
+    validate_private_key_size,
+    validate_validity_days,
+    validate_san_policy,
+    validate_leaf_issuance,
+    validate_csr_issuance,
+    validate_pathlen,
+    get_public_key_hash,
+)
+from micropki.audit import get_audit_logger, init_audit_logger, cert_fingerprint_sha256
+from micropki.compromise import check_csr_key_not_compromised
+from micropki.compromise import simulate_compromise
+from micropki.audit import get_audit_logger, init_audit_logger
+
+def _get_audit_dir(out_dir: Path) -> Path:
+    """Возвращает каталог для аудита."""
+    return out_dir / "audit"
+
+
 def validate_init_args(args) -> list[str]:
     """Валидация аргументов для ca init."""
     errors: list[str] = []
@@ -256,8 +275,28 @@ def append_intermediate_policy(out_dir, subject_dn_str, serial_number,
 
 def init_root_ca(subject, key_type, key_size, passphrase_file, out_dir,
                  validity_days, force, logger, db_path=None):
-    """Инициализация корневого УЦ."""
+    """Инициализация корневого УЦ (с аудитом и проверками политик)."""
     passphrase: bytes = b""
+
+    # Инициализируем аудит
+    audit_dir = _get_audit_dir(out_dir)
+    audit = init_audit_logger(audit_dir)
+
+    # POL-3: проверка размера ключа
+    key_errors = validate_private_key_size(key_type, key_size or
+                 (4096 if key_type == "rsa" else 384), "root_ca")
+    if key_errors:
+        for err in key_errors:
+            audit.log_policy_violation("ca_init", err)
+        raise ValueError("; ".join(key_errors))
+
+    # POL-4: проверка срока действия
+    days_errors = validate_validity_days(validity_days, "root_ca")
+    if days_errors:
+        for err in days_errors:
+            audit.log_policy_violation("ca_init", err)
+        raise ValueError("; ".join(days_errors))
+
     try:
         key_path = out_dir / "private" / "ca.key.pem"
         cert_path = out_dir / "certs" / "ca.cert.pem"
@@ -272,18 +311,18 @@ def init_root_ca(subject, key_type, key_size, passphrase_file, out_dir,
         else:
             serial_number = None
 
-        logger.info("Запуск генерации ключа: type=%s, size=%d", key_type, key_size)
-        private_key = generate_private_key(key_type, key_size)
-        logger.info("Генерация ключа успешно завершена")
+        logger.info("Генерация ключа: type=%s, size=%d", key_type,
+                    key_size or (4096 if key_type == "rsa" else 384))
+        private_key = generate_private_key(key_type,
+                      key_size or (4096 if key_type == "rsa" else 384))
+        logger.info("Генерация ключа завершена")
 
-        logger.info("Начало подписания сертификата")
         subject_name = parse_subject_dn(subject)
         certificate = build_root_ca_certificate(
             private_key=private_key, subject=subject_name,
             validity_days=validity_days, key_type=key_type,
             serial_number=serial_number,
         )
-        logger.info("Подписание сертификата завершено успешно")
 
         cert_pem = serialize_certificate_pem(certificate)
         _save_cert_to_db(db_path, certificate, cert_pem, logger)
@@ -292,18 +331,25 @@ def init_root_ca(subject, key_type, key_size, passphrase_file, out_dir,
         private_dir.mkdir(parents=True, exist_ok=True)
         key_pem = serialize_private_key_pem(private_key, passphrase)
         save_key_file(key_pem, key_path)
-        logger.info("Закрытый ключ сохранён в %s", key_path.resolve())
 
         certs_dir = out_dir / "certs"
         certs_dir.mkdir(parents=True, exist_ok=True)
         cert_path.write_bytes(cert_pem)
-        logger.info("Сертификат сохранён в %s", cert_path.resolve())
 
         generate_policy_file(subject, certificate.serial_number,
                              certificate.not_valid_before_utc,
                              certificate.not_valid_after_utc,
-                             key_type, key_size, out_dir)
+                             key_type, key_size or 4096, out_dir)
+
+        # Аудит (AUD-4) + CT (CTL-2)
+        from micropki.serial import serial_to_hex
+        s_hex = serial_to_hex(certificate.serial_number)
+        audit.log_ca_init("root", subject, "success")
+        fingerprint = cert_fingerprint_sha256(cert_pem)
+        audit.log_ct(s_hex, subject, fingerprint)
+
         logger.info("Инициализация корневого УЦ успешно завершена")
+
     finally:
         if passphrase:
             ba = bytearray(passphrase)
@@ -314,15 +360,42 @@ def init_root_ca(subject, key_type, key_size, passphrase_file, out_dir,
 def issue_intermediate(root_cert_path, root_key_path, root_pass_file, subject,
                        key_type, key_size, passphrase_file, out_dir,
                        validity_days, path_length, force, logger, db_path=None):
-    """Создание промежуточного УЦ."""
+    """Создание промежуточного УЦ (с аудитом и проверками политик)."""
     root_passphrase: bytes = b""
     inter_passphrase: bytes = b""
+
+    # Инициализируем аудит
+    audit_dir = _get_audit_dir(out_dir)
+    audit = init_audit_logger(audit_dir)
+
+    ks = key_size or (4096 if key_type == "rsa" else 384)
+
+    # POL-3
+    key_errors = validate_private_key_size(key_type, ks, "inter_ca")
+    if key_errors:
+        for err in key_errors:
+            audit.log_policy_violation("issue_intermediate", err)
+        raise ValueError("; ".join(key_errors))
+
+    # POL-4
+    days_errors = validate_validity_days(validity_days, "inter_ca")
+    if days_errors:
+        for err in days_errors:
+            audit.log_policy_violation("issue_intermediate", err)
+        raise ValueError("; ".join(days_errors))
+
+    # POL-7
+    pathlen_errors = validate_pathlen(path_length)
+    if pathlen_errors:
+        for err in pathlen_errors:
+            audit.log_policy_violation("issue_intermediate", err)
+        raise ValueError("; ".join(pathlen_errors))
+
     try:
         key_path = out_dir / "private" / "intermediate.key.pem"
         cert_path = out_dir / "certs" / "intermediate.cert.pem"
         check_existing_files([key_path, cert_path], force, logger)
 
-        logger.info("Чтение парольной фразы корневого УЦ")
         root_passphrase = read_passphrase(root_pass_file)
         root_cert = load_certificate(root_cert_path)
         root_private_key = load_encrypted_private_key(root_key_path, root_passphrase)
@@ -332,50 +405,51 @@ def issue_intermediate(root_cert_path, root_key_path, root_pass_file, subject,
         else:
             serial_number = None
 
-        logger.info("Генерация ключа промежуточного УЦ: type=%s, size=%d", key_type, key_size)
-        inter_private_key = generate_private_key(key_type, key_size)
-        logger.info("Генерация ключа промежуточного УЦ завершена")
+        inter_private_key = generate_private_key(key_type, ks)
 
-        logger.info("Генерация CSR для промежуточного УЦ")
         subject_name = parse_subject_dn(subject)
-        csr = build_intermediate_csr(inter_private_key, subject_name, path_length, key_type)
-        logger.info("CSR для промежуточного УЦ создан")
+        csr = build_intermediate_csr(inter_private_key, subject_name,
+                                     path_length, key_type)
 
         csrs_dir = out_dir / "csrs"
         csrs_dir.mkdir(parents=True, exist_ok=True)
         csr_path = csrs_dir / "intermediate.csr.pem"
         csr_path.write_bytes(serialize_csr_pem(csr))
 
-        logger.info("Подписание сертификата промежуточного УЦ корневым УЦ")
         inter_cert = build_intermediate_certificate(
             csr=csr, root_private_key=root_private_key, root_cert=root_cert,
             validity_days=validity_days, path_length=path_length,
             serial_number=serial_number,
         )
-        logger.info("Подписание сертификата промежуточного УЦ завершено")
 
         cert_pem = serialize_certificate_pem(inter_cert)
         _save_cert_to_db(db_path, inter_cert, cert_pem, logger)
 
-        logger.info("Чтение парольной фразы промежуточного УЦ")
         inter_passphrase = read_passphrase(passphrase_file)
         private_dir = out_dir / "private"
         private_dir.mkdir(parents=True, exist_ok=True)
         inter_key_pem = serialize_private_key_pem(inter_private_key, inter_passphrase)
         save_key_file(inter_key_pem, key_path)
-        logger.info("Ключ промежуточного УЦ сохранён в %s", key_path.resolve())
 
         certs_dir = out_dir / "certs"
         certs_dir.mkdir(parents=True, exist_ok=True)
         cert_path.write_bytes(cert_pem)
-        logger.info("Сертификат промежуточного УЦ сохранён в %s", cert_path.resolve())
 
         issuer_dn = _dn_to_string(root_cert.subject)
         append_intermediate_policy(out_dir, subject, inter_cert.serial_number,
                                    inter_cert.not_valid_before_utc,
                                    inter_cert.not_valid_after_utc,
-                                   key_type, key_size, path_length, issuer_dn)
+                                   key_type, ks, path_length, issuer_dn)
+
+        # Аудит + CT
+        from micropki.serial import serial_to_hex
+        s_hex = serial_to_hex(inter_cert.serial_number)
+        audit.log_ca_init("intermediate", subject, "success")
+        fingerprint = cert_fingerprint_sha256(cert_pem)
+        audit.log_ct(s_hex, subject, fingerprint, issuer_dn)
+
         logger.info("Создание промежуточного УЦ успешно завершено")
+
     finally:
         for secret in (root_passphrase, inter_passphrase):
             if secret:
@@ -387,57 +461,92 @@ def issue_intermediate(root_cert_path, root_key_path, root_pass_file, subject,
 def issue_leaf_cert(ca_cert_path, ca_key_path, ca_pass_file, template_name,
                     subject, san_strings, key_type, key_size, out_dir,
                     validity_days, logger, db_path=None):
-    """Выпуск конечного сертификата по шаблону."""
+    """Выпуск конечного сертификата (с аудитом и проверками политик)."""
     ca_passphrase: bytes = b""
+
+    # Аудит
+    audit_dir = _get_audit_dir(out_dir.parent if out_dir.name == "certs" else out_dir)
+    audit = get_audit_logger() or init_audit_logger(audit_dir)
+
+    ks = key_size or (2048 if key_type == "rsa" else 256)
+
+    # Парсируем SAN заранее для проверок политик
     try:
-        logger.info("Чтение парольной фразы промежуточного УЦ")
+        san_entries = parse_san_entries(san_strings)
+    except ValueError as e:
+        audit.log_policy_violation("issue_certificate", str(e), subject)
+        raise
+
+    # Комплексная проверка политик (POL-3, POL-4, POL-5)
+    policy_errors = validate_leaf_issuance(
+        key_type, ks, validity_days, san_entries, template_name
+    )
+    if policy_errors:
+        for err in policy_errors:
+            logger.error("Нарушение политики: %s", err)
+            audit.log_policy_violation("issue_certificate", err, subject)
+        raise ValueError(
+            "Выпуск запрещён политикой:\n" + "\n".join(f"  • {e}" for e in policy_errors)
+        )
+
+    try:
         ca_passphrase = read_passphrase(ca_pass_file)
         ca_cert = load_certificate(ca_cert_path)
         ca_private_key = load_encrypted_private_key(ca_key_path, ca_passphrase)
 
         template = get_template(template_name)
-        san_entries = parse_san_entries(san_strings)
 
         if db_path and check_schema(db_path):
             serial_number = generate_unique_serial(db_path)
         else:
             serial_number = None
 
-        logger.info("Генерация ключа конечного субъекта: type=%s, size=%d", key_type, key_size)
-        leaf_private_key = generate_private_key(key_type, key_size)
-        logger.info("Генерация ключа конечного субъекта завершена")
+        leaf_private_key = generate_private_key(key_type, ks)
 
-        logger.info("Выпуск сертификата: шаблон=%s, субъект=%s, SAN=%s",
-                     template_name, subject, san_strings)
         subject_name = parse_subject_dn(subject)
         leaf_cert = build_leaf_certificate(
-            subject=subject_name, leaf_public_key=leaf_private_key.public_key(),
-            ca_private_key=ca_private_key, ca_cert=ca_cert, template=template,
-            san_entries=san_entries, validity_days=validity_days,
-            leaf_key_type=key_type, serial_number=serial_number,
+            subject=subject_name,
+            leaf_public_key=leaf_private_key.public_key(),
+            ca_private_key=ca_private_key,
+            ca_cert=ca_cert,
+            template=template,
+            san_entries=san_entries,
+            validity_days=validity_days,
+            leaf_key_type=key_type,
+            serial_number=serial_number,
         )
-        logger.info("Выпуск конечного сертификата завершён")
 
         cert_pem = serialize_certificate_pem(leaf_cert)
         _save_cert_to_db(db_path, leaf_cert, cert_pem, logger)
 
         cn = get_cn_from_subject(subject_name)
         safe_name = sanitize_filename(cn)
-        cert_filename = f"{safe_name}.cert.pem"
-        key_filename = f"{safe_name}.key.pem"
-
         out_dir.mkdir(parents=True, exist_ok=True)
-        cert_path = out_dir / cert_filename
-        cert_path.write_bytes(cert_pem)
-        logger.info("Сертификат сохранён в %s", cert_path.resolve())
 
-        key_path = out_dir / key_filename
+        cert_path = out_dir / f"{safe_name}.cert.pem"
+        cert_path.write_bytes(cert_pem)
+
+        key_path = out_dir / f"{safe_name}.key.pem"
         key_pem = serialize_private_key_pem_unencrypted(leaf_private_key)
         save_key_file(key_pem, key_path)
         logger.warning("Ключ сохранён БЕЗ ШИФРОВАНИЯ в %s", key_path.resolve())
 
         serial_hex = serial_to_hex(leaf_cert.serial_number)
-        logger.info("Аудит: serial=%s, subject=%s, template=%s", serial_hex, subject, template_name)
+
+        # Аудит (AUD-4) + CT (CTL-2)
+        audit.log_issue(
+            serial=serial_hex,
+            subject=subject,
+            template=template_name,
+            status="success",
+        )
+        fingerprint = cert_fingerprint_sha256(cert_pem)
+        issuer_dn = _dn_to_string(ca_cert.subject)
+        audit.log_ct(serial_hex, subject, fingerprint, issuer_dn)
+
+        logger.info("Аудит: serial=%s, subject=%s, template=%s",
+                    serial_hex, subject, template_name)
+
     finally:
         if ca_passphrase:
             ba = bytearray(ca_passphrase)
@@ -445,43 +554,52 @@ def issue_leaf_cert(ca_cert_path, ca_key_path, ca_pass_file, template_name,
                 ba[i] = 0
 
 
-def issue_leaf_from_csr(
-    ca_cert_path, ca_key_path, ca_pass_file, template_name,
-    csr_path, out_dir, validity_days, logger, db_path=None,
-):
-    """
-    Выпуск конечного сертификата из внешнего CSR (CA-1).
-
-    - Открытый ключ берётся из CSR.
-    - Субъект берётся из CSR.
-    - SAN берётся из расширения SAN в CSR.
-    - Подпись CSR проверяется.
-
-    :param csr_path: путь к файлу CSR (PEM)
-    """
+def issue_leaf_from_csr(ca_cert_path, ca_key_path, ca_pass_file, template_name,
+                        csr_path, out_dir, validity_days, logger, db_path=None):
+    """Выпуск сертификата из CSR (с аудитом и проверками политик)."""
     ca_passphrase: bytes = b""
+
+    # Аудит
+    audit_dir = _get_audit_dir(out_dir.parent if out_dir.name == "certs" else out_dir)
+    audit = get_audit_logger() or init_audit_logger(audit_dir)
+
     try:
-        logger.info("Чтение парольной фразы УЦ (режим CSR)")
         ca_passphrase = read_passphrase(ca_pass_file)
         ca_cert = load_certificate(ca_cert_path)
         ca_private_key = load_encrypted_private_key(ca_key_path, ca_passphrase)
 
-        # Загружаем и проверяем CSR
         from cryptography import x509 as _x509
+        from micropki.csr import verify_csr_signature
         csr_pem = csr_path.read_bytes()
         try:
             csr = _x509.load_pem_x509_csr(csr_pem)
         except Exception as e:
             raise ValueError(f"Не удалось загрузить CSR: {e}")
 
-        try:
-            from micropki.csr import verify_csr_signature
-            verify_csr_signature(csr)
-        except Exception as e:
-            raise ValueError(f"Подпись CSR недействительна: {e}")
+        verify_csr_signature(csr)
+
+        # Проверки политик (POL-3..6)
+        from micropki.policy import validate_csr_issuance
+        policy_errors = validate_csr_issuance(csr, validity_days, template_name)
+        if policy_errors:
+            for err in policy_errors:
+                logger.error("Нарушение политики: %s", err)
+                audit.log_policy_violation("issue_from_csr", err)
+            raise ValueError(
+                "Выпуск запрещён политикой:\n" +
+                "\n".join(f"  • {e}" for e in policy_errors)
+            )
+
+        # CTL-4: проверка скомпрометированного ключа
+        if db_path:
+            comp_errors = check_csr_key_not_compromised(db_path, csr)
+            if comp_errors:
+                for err in comp_errors:
+                    audit.log_policy_violation("issue_from_csr", err)
+                raise ValueError("; ".join(comp_errors))
 
         logger.info(
-            "CSR загружен и проверен: subject=%s", csr.subject.rfc4514_string()
+            "CSR загружен: subject=%s", csr.subject.rfc4514_string()
         )
 
         from micropki.templates import get_template
@@ -489,18 +607,12 @@ def issue_leaf_from_csr(
             build_leaf_certificate_from_csr,
             serialize_certificate_pem,
         )
-
         template = get_template(template_name)
 
         if db_path and check_schema(db_path):
             serial_number = generate_unique_serial(db_path)
         else:
             serial_number = None
-
-        logger.info(
-            "Выпуск сертификата из CSR: шаблон=%s, subject=%s",
-            template_name, csr.subject.rfc4514_string(),
-        )
 
         leaf_cert = build_leaf_certificate_from_csr(
             csr=csr,
@@ -514,23 +626,29 @@ def issue_leaf_from_csr(
         cert_pem = serialize_certificate_pem(leaf_cert)
         _save_cert_to_db(db_path, leaf_cert, cert_pem, logger)
 
-        # Имя файла из CN субъекта (из CSR)
         subject_name = leaf_cert.subject
         cn = get_cn_from_subject(subject_name)
         safe_name = sanitize_filename(cn)
-        cert_filename = f"{safe_name}.cert.pem"
-
         out_dir.mkdir(parents=True, exist_ok=True)
-        cert_path = out_dir / cert_filename
+        cert_path = out_dir / f"{safe_name}.cert.pem"
         cert_path.write_bytes(cert_pem)
-        logger.info("Сертификат (из CSR) сохранён: %s", cert_path.resolve())
 
         serial_hex = serial_to_hex(leaf_cert.serial_number)
-        logger.info(
-            "Аудит: serial=%s, subject=%s, template=%s, source=csr",
-            serial_hex, csr.subject.rfc4514_string(), template_name,
-        )
+        subj_str = csr.subject.rfc4514_string()
 
+        # Аудит + CT
+        audit.log_issue(
+            serial=serial_hex,
+            subject=subj_str,
+            template=template_name,
+            status="success",
+            message=f"Выпуск из CSR: {subj_str}",
+        )
+        fingerprint = cert_fingerprint_sha256(cert_pem)
+        issuer_dn = _dn_to_string(ca_cert.subject)
+        audit.log_ct(serial_hex, subj_str, fingerprint, issuer_dn)
+
+        logger.info("Сертификат (из CSR) сохранён: %s", cert_path.resolve())
         print(f"Сертификат выпущен из CSR: {cert_path}")
 
     finally:
@@ -757,8 +875,12 @@ def main() -> None:
             try:
                 from micropki.server import run_server
                 run_server(
-                    host=args.host, port=args.port,
-                    db_path=str(args.db_path), cert_dir=str(args.cert_dir),
+                    host=args.host,
+                    port=args.port,
+                    db_path=str(args.db_path),
+                    cert_dir=str(args.cert_dir),
+                    rate_limit=getattr(args, "rate_limit", 0),
+                    rate_burst=getattr(args, "rate_burst", 10),
                 )
             except Exception as e:
                 logger.error("Ошибка сервера: %s", e)
@@ -1024,12 +1146,15 @@ def main() -> None:
 
                     sys.exit(1)
 
+
             else:
 
                 # Обычный режим (генерация ключа)
 
                 if not args.subject:
-                    print("Ошибка: --subject обязателен если --csr не указан.", file=sys.stderr)
+                    print("Ошибка: --subject обязателен если --csr не указан.",
+
+                          file=sys.stderr)
 
                     sys.exit(1)
 
@@ -1037,10 +1162,32 @@ def main() -> None:
 
                 if errors:
 
+                    # Записываем все нарушения в аудит перед выходом
+
+                    audit_dir = _get_audit_dir(
+
+                        args.out_dir.parent
+
+                        if args.out_dir.name == "certs"
+
+                        else args.out_dir
+
+                    )
+
+                    audit = get_audit_logger() or init_audit_logger(audit_dir)
+
                     for err in errors:
                         logger.error("Ошибка валидации: %s", err)
 
                         print(f"Ошибка: {err}", file=sys.stderr)
+
+                        audit.log_policy_violation(
+
+                            "issue_certificate", err,
+
+                            subject=args.subject or "",
+
+                        )
 
                     sys.exit(1)
 
@@ -1197,4 +1344,184 @@ def main() -> None:
             except Exception as e:
                 logger.error("Ошибка генерации CRL: %s", e)
                 print(f"Ошибка: {e}", file=sys.stderr)
+                sys.exit(1)
+
+        elif args.ca_action == "compromise":
+            # CLI-33, CTL-3
+            from micropki.crypto_utils import read_passphrase
+            if not args.cert.exists():
+                print(f"Ошибка: файл сертификата не найден: {args.cert}",
+                      file=sys.stderr)
+                sys.exit(1)
+
+            if not args.force:
+                answer = input(
+                    f"Вы уверены, что хотите пометить ключ сертификата "
+                    f"'{args.cert}' как скомпрометированный? [y/N]: "
+                )
+                if answer.lower() not in ("y", "yes", "д", "да"):
+                    print("Отмена.")
+                    sys.exit(0)
+
+            # Инициализируем аудит
+            audit_dir = args.out_dir / "audit"
+            audit = get_audit_logger() or init_audit_logger(audit_dir)
+
+            # Читаем пароль CA если нужен CRL
+            ca_passphrase = None
+            generate_crl_flag = (
+                    args.ca_cert is not None
+                    and args.ca_key is not None
+                    and args.ca_pass_file is not None
+            )
+            if generate_crl_flag:
+                ca_passphrase = read_passphrase(args.ca_pass_file)
+
+            try:
+                result = simulate_compromise(
+                    db_path=args.db_path,
+                    cert_path=args.cert,
+                    reason=args.reason,
+                    logger_inst=logger,
+                    generate_crl=generate_crl_flag,
+                    ca_cert_path=args.ca_cert,
+                    ca_key_path=args.ca_key,
+                    ca_passphrase=ca_passphrase,
+                    out_dir=args.out_dir,
+                    audit_logger=audit,
+                )
+
+                print(result["message"])
+                print(f"Серийный номер:  {result['serial']}")
+                print(f"Субъект:         {result['subject']}")
+                print(f"Хеш ключа:       {result['key_hash'][:32]}...")
+                if result.get("crl_path"):
+                    print(f"Экстренный CRL:  {result['crl_path']}")
+
+            except Exception as e:
+                logger.error("Ошибка симуляции компрометации: %s", e)
+                print(f"Ошибка: {e}", file=sys.stderr)
+                sys.exit(1)
+            finally:
+                if ca_passphrase:
+                    ba = bytearray(ca_passphrase)
+                    for i in range(len(ba)):
+                        ba[i] = 0
+
+    elif args.command == "audit":
+
+        if getattr(args, "audit_action", None) is None:
+            parser.parse_args(["audit", "--help"])
+            sys.exit(1)
+
+        from micropki.audit import (
+            query_audit_log,
+            verify_audit_log,
+            load_audit_log,
+        )
+        from micropki.transparency import verify_ct_inclusion, query_ct_log
+        import json as _json
+        import csv as _csv
+        import io as _io
+
+        if args.audit_action == "query":
+            # CLI-31
+            entries = query_audit_log(
+                log_path=args.log_file,
+                from_ts=args.from_ts,
+                to_ts=args.to_ts,
+                level=args.level,
+                operation=args.operation,
+                serial=args.serial,
+            )
+
+            if not entries:
+                print("Записи не найдены.")
+                sys.exit(0)
+
+            # Проверка целостности если --verify
+            if args.verify:
+                ok, errors = verify_audit_log(args.log_file)
+                if not ok:
+                    print("ВНИМАНИЕ: Целостность журнала нарушена!", file=sys.stderr)
+                    for err in errors:
+                        print(f"  ✗ {err}", file=sys.stderr)
+                    sys.exit(1)
+
+            if args.output_format == "json":
+                print(_json.dumps(entries, indent=2, ensure_ascii=False))
+
+            elif args.output_format == "csv":
+                out = _io.StringIO()
+                writer = _csv.writer(out)
+                writer.writerow(["timestamp", "level", "operation",
+                                 "status", "message"])
+                for e in entries:
+                    writer.writerow([
+                        e.get("timestamp", ""),
+                        e.get("level", ""),
+                        e.get("operation", ""),
+                        e.get("status", ""),
+                        e.get("message", ""),
+                    ])
+                print(out.getvalue())
+
+            else:  # table
+                headers = ["Timestamp", "Level", "Operation", "Status", "Message"]
+                rows = []
+                for e in entries:
+                    rows.append([
+                        e.get("timestamp", "")[:19],
+                        e.get("level", ""),
+                        e.get("operation", "")[:25],
+                        e.get("status", ""),
+                        e.get("message", "")[:50],
+                    ])
+
+                col_widths = [len(h) for h in headers]
+                for row in rows:
+                    for i, cell in enumerate(row):
+                        col_widths[i] = max(col_widths[i], len(str(cell)))
+
+                fmt = " | ".join(f"{{:<{w}}}" for w in col_widths)
+                sep = "-+-".join("-" * w for w in col_widths)
+                print(fmt.format(*headers))
+                print(sep)
+                for row in rows:
+                    print(fmt.format(*[str(c) for c in row]))
+
+            print(f"\nВсего записей: {len(entries)}")
+
+        elif args.audit_action == "verify":
+            # CLI-32
+            print(f"Проверка целостности журнала: {args.log_file}")
+            ok, errors = verify_audit_log(
+                log_path=args.log_file,
+                chain_path=args.chain_file,
+            )
+            if ok:
+                print("Целостность журнала аудита подтверждена.")
+                sys.exit(0)
+            else:
+                print("НАРУШЕНИЕ ЦЕЛОСТНОСТИ ЖУРНАЛА!", file=sys.stderr)
+                for err in errors:
+                    print(f"  • {err}", file=sys.stderr)
+                sys.exit(1)
+
+        elif args.audit_action == "ct-verify":
+            # CTL-2
+            found = verify_ct_inclusion(args.ct_log, args.serial)
+            if found:
+                print(f" Сертификат {args.serial} найден в CT-журнале.")
+                # Показываем детали
+                entries = query_ct_log(args.ct_log, serial_hex=args.serial)
+                for e in entries:
+                    print(f"  Время:       {e['timestamp']}")
+                    print(f"  Серийный:    {e['serial']}")
+                    print(f"  Субъект:     {e['subject']}")
+                    print(f"  Отпечаток:   {e['fingerprint']}")
+                sys.exit(0)
+            else:
+                print(f" Сертификат {args.serial} НЕ найден в CT-журнале.",
+                      file=sys.stderr)
                 sys.exit(1)

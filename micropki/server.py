@@ -69,6 +69,10 @@ def create_app(db_path: str, cert_dir: str) -> FastAPI:
     :return: экземпляр FastAPI
     """
 
+    from micropki.ratelimit import get_rate_limiter
+    from fastapi.responses import JSONResponse
+    import math
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger.info("Сервер репозитория запущен (db=%s, certs=%s)", db_path, cert_dir)
@@ -99,6 +103,27 @@ def create_app(db_path: str, cert_dir: str) -> FastAPI:
             "[HTTP] %s %s %s → %d",
             request.method, request.url.path, client_ip, response.status_code,
         )
+        return response
+
+    @app.middleware("http")
+    async def rate_limit_middleware(request: Request, call_next):
+        """Rate limiting по IP (CTL-1)."""
+        limiter = get_rate_limiter()
+        if limiter:
+            client_ip = request.client.host if request.client else "unknown"
+            allowed, retry_after = limiter.check(client_ip)
+            if not allowed:
+                retry_secs = math.ceil(retry_after)
+                http_logger.warning(
+                    "[RATE-LIMIT] %s превысил лимит запросов, retry_after=%ds",
+                    client_ip, retry_secs,
+                )
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Too Many Requests. Превышен лимит запросов."},
+                    headers={"Retry-After": str(retry_secs)},
+                )
+        response = await call_next(request)
         return response
 
     @app.get("/certificate/{serial_hex}")
@@ -344,11 +369,26 @@ def create_app(db_path: str, cert_dir: str) -> FastAPI:
     return app
 
 
-def run_server(host: str, port: int, db_path: str, cert_dir: str) -> None:
+def run_server(
+    host: str,
+    port: int,
+    db_path: str,
+    cert_dir: str,
+    rate_limit: float = 0,
+    rate_burst: int = 10,
+) -> None:
     """Запускает HTTP-сервер репозитория."""
     if not check_schema(db_path):
         logger.error("БД не инициализирована: %s", db_path)
         raise RuntimeError("База данных не инициализирована")
+
+    # Rate limiting
+    from micropki.ratelimit import init_rate_limiter
+    if rate_limit > 0:
+        init_rate_limiter(rate=rate_limit, burst=rate_burst)
+        logger.info(
+            "Rate limiting включён: %g req/s, burst=%d", rate_limit, rate_burst
+        )
 
     app = create_app(db_path, cert_dir)
     logger.info("Запуск сервера на http://%s:%d", host, port)

@@ -459,6 +459,68 @@ micropki client check-status \
 # Коды завершения: 0 = good, 1 = revoked, 2 = unknown
 ```
 
+# Журнал аудита
+Журнал создаётся автоматически при первой операции CA. Расположение: pki/audit/audit.log.
+```bash
+# Просмотр всех записей
+micropki audit query --log-file pki/audit/audit.log
+
+# Только нарушения политик
+micropki audit query --log-file pki/audit/audit.log --operation policy_violation
+
+# Только аудитные события высокой критичности
+micropki audit query --log-file pki/audit/audit.log --level AUDIT
+
+# Проверка целостности
+micropki audit verify --log-file pki/audit/audit.log
+```
+
+# CT-журнал
+Создаётся автоматически при каждом выпуске сертификата. Расположение: pki/audit/ct.log.
+```bash
+# Проверить наличие сертификата в CT
+micropki audit ct-verify --serial <СЕРИЙНЫЙ_НОМЕР> --ct-log pki/audit/ct.log
+
+# Просмотр CT-журнала напрямую
+cat pki/audit/ct.log
+Компрометация ключа
+Bash
+
+# Простая компрометация (только отзыв + БД)
+micropki ca compromise \
+    --cert pki/certs/example.cert.pem \
+    --reason keyCompromise \
+    --force \
+    --db-path pki/micropki.db
+
+# С генерацией экстренного CRL
+micropki ca compromise \
+    --cert pki/certs/example.cert.pem \
+    --reason keyCompromise \
+    --force \
+    --db-path pki/micropki.db \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --out-dir pki
+```
+
+# Rate Limiting
+```bash
+# Запустить сервер с ограничением 5 req/s, burst 10
+micropki repo serve \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --rate-limit 5 \
+    --rate-burst 10
+
+# OCSP с ограничением
+micropki ocsp serve \
+    --rate-limit 10 \
+    --rate-burst 20 \
+#    ... (остальные параметры)
+```
+
 ## Тестирование
 ### TEST-1
 ```bash
@@ -1971,6 +2033,457 @@ micropki ca issue-cert \
 #          через этот эндпоинт запрещён политикой.
 ```
 
+### TEST-51
+```bash
+# Попытка выпустить сертификат с RSA-ключом размером меньше минимума
+# Обычный issue-cert использует key_size от пользователя
+
+# Попытаться выпустить с ключом 1024 бит
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=small-key.example.com" \
+    --san dns:small-key.example.com \
+    --key-type rsa \
+    --key-size 1024 \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Ожидаемый вывод:
+# Ошибка: Выпуск запрещён политикой:
+#   • RSA-ключ 1024 бит не соответствует минимуму 2048 бит для leaf.
+
+
+# Проверить что запись аудита о нарушении политики создана
+micropki audit query \
+    --log-file pki/audit/audit.log \
+    --operation policy_violation \
+    --format table
+
+# Ожидаемый вывод: строка с operation=policy_violation
+
+# Убедиться что валидный сертификат (2048 бит) выпускается
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=valid-key.example.com" \
+    --san dns:valid-key.example.com \
+    --key-type rsa \
+    --key-size 2048 \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Ожидаемый вывод: сертификат выпущен успешно
+```
+
+### TEST-52
+```bash
+# Попытка выпустить сертификат со сроком 400 дней
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=long-lived.example.com" \
+    --san dns:long-lived.example.com \
+    --validity-days 400 \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Ожидаемый вывод:
+# Ошибка: Выпуск запрещён политикой:
+#   • Срок действия 400 дней превышает максимум 365 дней для leaf.
+
+
+# Попытка с ровно 365 днями — должна пройти
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=valid-days.example.com" \
+    --san dns:valid-days.example.com \
+    --validity-days 365 \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Ожидаемый вывод: сертификат выпущен
+
+# Проверить аудит
+micropki audit query \
+    --log-file pki/audit/audit.log \
+    --operation policy_violation
+# Ожидаемый вывод: запись о нарушении с "400 дней"
+```
+
+### TEST-53
+```bash
+# Попытка выпустить серверный сертификат с wildcard
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=wildcard.example.com" \
+    --san "dns:*.example.com" \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Ожидаемый вывод:
+# Ошибка: Выпуск запрещён политикой:
+#   • Wildcard SAN '*.example.com' запрещён политикой. ...
+
+# Проверить аудит
+micropki audit query \
+    --log-file pki/audit/audit.log \
+    --operation policy_violation --format json
+# Ожидаемый вывод: JSON с записями о wildcard-нарушении
+```
+
+### TEST-54
+```bash
+# Попытка выпустить code_signing сертификат с email SAN
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template code_signing \
+    --subject "CN=code-signer.example.com" \
+    --san "email:dev@example.com" \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Ожидаемый вывод:
+# Ошибка: Выпуск запрещён политикой:
+#   • Тип SAN 'email' запрещён для шаблона 'code_signing'. ...
+
+# Корректный code_signing (без email)
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template code_signing \
+    --subject "CN=code-signer.example.com" \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Ожидаемый вывод: сертификат выпущен
+```
+
+### TEST-55
+```bash
+# Выполнить несколько операций для создания записей
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=audit-test1.example.com" \
+    --san dns:audit-test1.example.com \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=audit-test2.example.com" \
+    --san dns:audit-test2.example.com \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Проверить целостность — должно быть OK
+micropki audit verify --log-file pki/audit/audit.log
+# Ожидаемый вывод: Целостность журнала аудита подтверждена.
+
+# Вручную изменить один байт в журнале
+# Linux:
+python3 -c "
+content = open('pki/audit/audit.log', 'rb').read()
+# Меняем байт в середине второй строки
+lines = content.split(b'\n')
+if len(lines) >= 2 and lines[1]:
+    mid = len(lines[1]) // 2
+    line = bytearray(lines[1])
+    line[mid] ^= 1
+    lines[1] = bytes(line)
+open('pki/audit/audit.log', 'wb').write(b'\n'.join(lines))
+print('Файл журнала изменён')
+"
+
+# Запустить verify — должно обнаружить подделку
+micropki audit verify --log-file pki/audit/audit.log
+
+# Ожидаемый вывод:
+# НАРУШЕНИЕ ЦЕЛОСТНОСТИ ЖУРНАЛА!
+#   • Запись #2 (...): hash не совпадает (запись модифицирована)...
+```
+
+### TEST-56
+```bash
+# Убедиться что в журнале есть несколько записей
+micropki audit query --log-file pki/audit/audit.log --format table
+# Посмотреть сколько записей
+
+# Выполнить три операции
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template client \
+    --subject "CN=chain-test-A" \
+    --san email:a@test.com \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template client \
+    --subject "CN=chain-test-B" \
+    --san email:b@test.com \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template client \
+    --subject "CN=chain-test-C" \
+    --san email:c@test.com \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Проверить что chain-test-B присутствует
+micropki audit query \
+    --log-file pki/audit/audit.log \
+    --operation issue_certificate
+
+# Удалить запись B из журнала
+python3 -c "
+import json
+lines = [l for l in open('pki/audit/audit.log').readlines() if l.strip()]
+filtered = []
+for l in lines:
+    try:
+        entry = json.loads(l)
+        # Пропускаем запись с chain-test-B
+        if 'chain-test-B' in entry.get('message', ''):
+            print(f'Удаляем запись: {entry[\"message\"]}')
+            continue
+    except:
+        pass
+    filtered.append(l)
+open('pki/audit/audit.log', 'w').writelines(filtered)
+print(f'Осталось строк: {len(filtered)}')
+"
+
+# Запустить verify — должно обнаружить пропущенную запись
+micropki audit verify --log-file pki/audit/audit.log
+
+# Ожидаемый вывод:
+# НАРУШЕНИЕ ЦЕЛОСТНОСТИ ЖУРНАЛА!
+#   • Запись #... (...): prev_hash не совпадает...
+```
+
+### TEST-57
+```bash
+# Выпустить сертификат для теста
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=compromise-test.example.com" \
+    --san dns:compromise-test.example.com \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Убедиться что сертификат действителен
+micropki ca list-certs --status valid --format table
+# Ожидаемый вывод: CN=compromise-test.example.com в таблице со статусом valid
+
+# Симулировать компрометацию ключа
+micropki ca compromise \
+    --cert pki/certs/compromise-test.example.com.cert.pem \
+    --reason keyCompromise \
+    --force \
+    --db-path pki/micropki.db \
+    --out-dir pki
+
+# Ожидаемый вывод:
+# Ключ сертификата <СЕРИЙНЫЙ> (CN=compromise-test.example.com) 
+#   помечен как скомпрометированный и немедленно отозван.
+# Серийный номер:  <СЕРИЙНЫЙ>
+# Субъект:         CN=compromise-test.example.com
+# Хеш ключа:       <первые 32 символа>...
+
+# Проверить что статус изменился на revoked
+micropki ca list-certs --status revoked --format table
+# Ожидаемый вывод: CN=compromise-test.example.com со статусом revoked
+
+# Проверить аудит о компрометации
+micropki audit query \
+    --log-file pki/audit/audit.log \
+    --operation key_compromise
+# Ожидаемый вывод: запись с operation=key_compromise, высокий уровень AUDIT
+
+# Попытаться выпустить новый сертификат с тем же ключом (через CSR)
+# Сначала создать CSR со скомпрометированным ключом
+openssl req -new \
+    -key pki/certs/compromise-test.example.com.key.pem \
+    -subj "/CN=reuse-compromised.example.com" \
+    -addext "subjectAltName=DNS:reuse-compromised.example.com" \
+    -out /tmp/reuse.csr.pem
+
+# Попытаться выпустить
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --csr /tmp/reuse.csr.pem \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Ожидаемый вывод:
+# Ошибка: Ключ скомпрометирован (hash=...). Выпуск сертификата с этим ключом запрещён.
+
+# Компрометация с генерацией экстренного CRL
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=emergency-crl-test.example.com" \
+    --san dns:emergency-crl-test.example.com \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+micropki ca compromise \
+    --cert pki/certs/emergency-crl-test.example.com.cert.pem \
+    --reason keyCompromise \
+    --force \
+    --db-path pki/micropki.db \
+    --out-dir pki \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass
+
+# Ожидаемый вывод:
+# ... помечен как скомпрометированный ...
+# Экстренный CRL:  pki/crl/intermediate.crl.pem
+
+# Проверить CRL
+openssl crl -in pki/crl/intermediate.crl.pem -text -noout
+# Ожидаемый вывод: обновлённый CRL с новым отозванным сертификатом
+```
+
+### TEST-58
+```bash
+# Запустить сервер с ограничением 1 req/s, burst=2
+MICROPKI_CA_PASS="$(cat secrets/intermediate.pass)" micropki repo serve \
+    --host 127.0.0.1 \
+    --port 8080 \
+    --rate-limit 1 \
+    --rate-burst 2 \
+    --db-path pki/micropki.db \
+    --cert-dir pki/certs
+
+# Ожидаемый вывод: INFO Rate limiting включён: 1 req/s, burst=2
+
+# В другом терминале — отправить 5 быстрых запросов
+# Linux/bash:
+for i in $(seq 1 5); do
+    code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/ca/root)
+    echo "Запрос $i: HTTP $code"
+done
+
+# Ожидаемый вывод:
+# Запрос 1: HTTP 200
+# Запрос 2: HTTP 200
+# Запрос 3: HTTP 429
+# Запрос 4: HTTP 429
+# Запрос 5: HTTP 429
+
+# Проверить заголовок Retry-After
+curl -v http://localhost:8080/ca/root 2>&1 | grep -i "retry-after"
+# Ожидаемый вывод: Retry-After: <число секунд>
+
+# После паузы в 2 секунды — запрос должен пройти
+sleep 2
+curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:8080/ca/root
+# Ожидаемый вывод: HTTP 200
+```
+
+### TEST-59
+```bash
+# Выпустить сертификат (аудит и CT пишутся автоматически)
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=ct-test.example.com" \
+    --san dns:ct-test.example.com \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+
+# Найти серийный номер выпущенного сертификата
+micropki ca list-certs --format json | python3 -c \
+    "import sys,json; [print(c['serial_hex']) for c in json.load(sys.stdin) \
+     if 'ct-test' in c['subject']]"
+
+# Скопируем серийный номер 6A2040D9CF8BB4D4
+
+# Проверить наличие в CT-журнале через grep
+grep 6A2040D9CF8BB4D4 pki/audit/ct.log
+# Ожидаемый вывод: строка с серийным номером, субъектом и отпечатком
+
+# Проверить через команду ct-verify
+micropki audit ct-verify \
+    --serial 6A2040D9CF8BB4D4 \
+    --ct-log pki/audit/ct.log
+
+# Ожидаемый вывод:
+# Сертификат 6A2040D9CF8BB4D4 найден в CT-журнале.
+#   Время:       2026-...
+#   Серийный:    <CT_SERIAL>
+#   Субъект:     CN=ct-test.example.com
+#   Отпечаток:   <hex строка>
+
+# Проверить несуществующий серийный номер
+micropki audit ct-verify \
+    --serial DEADBEEF00000000 \
+    --ct-log pki/audit/ct.log
+
+# Ожидаемый вывод:
+# Сертификат DEADBEEF00000000 НЕ найден в CT-журнале.
+```
+
+### TEST-60
+```bash
+bash tests/test_integration_sprint7.sh
+
+# Ожидаемый вывод:
+#=== Подготовка рабочей среды ===
+#Рабочий каталог: /tmp/micropki_test_jPh9NY
+#2026-06-03T18:05:38 INFO Создание схемы версии 1...
+#2026-06-03T18:05:38 INFO Миграция схемы: версия 1 → 2...
+#2026-06-03T18:05:38 INFO Миграция схемы: версия 2 → 3 (compromised_keys)...
+#2026-06-03T18:05:38 INFO База данных инициализирована: pki/micropki.db (версия схемы: 3)
+#База данных инициализирована: pki/micropki.db
+#  PASS: Инициализация БД
+#2026-06-03T18:05:38 INFO Чтение парольной фразы из файла
+```
+
 ## Структура выходных файлов
 ```text
 pki/
@@ -1986,6 +2499,10 @@ pki/
 │   ├── Alice_Smith.key.pem          # незашифрованный ключ клиента
 │   ├── MicroPKI_Code_Signer.cert.pem
 │   └── MicroPKI_Code_Signer.key.pem
+├── audit/
+│   ├── audit.log    — NDJSON-журнал аудита с хеш-цепочкой
+│   ├── chain.dat    — последний хеш цепочки (для верификации)
+│   └── ct.log       — симуляция CT-журнала (публичный, 0o644)
 ├── csrs/
 │   └── intermediate.csr.pem         # CSR промежуточного CA
 ├── crl/
@@ -2020,13 +2537,19 @@ MicroPKI/
 │   ├── client.py             # Клиентская логика
 │   ├── revocation_check.py   # Проверка CRL/OCSP
 │   ├── validation.py         # Проверка цепочки
+│   ├── audit.py              # Логика аудита
+│   ├── compromise.py         # Логика компрометации
+│   ├── policy.py             # Политика
+│   ├── ratilimit.py          # Лимит запросов
+│   ├── transparency.py       # CT-журнал
 │   └── logger.py             # настройка логирования
 ├── tests/
 │   ├── test_csr.py           
 │   ├── test_negative.py               
 │   ├── test_san.py
 │   ├── test_api.py 
-│   ├── test_serial.py                 
+│   ├── test_serial.py  
+│   ├── test_integration_sprint7.sh               
 │   └── test_templates.py
 ├── .gitignore
 ├── pyproject.toml

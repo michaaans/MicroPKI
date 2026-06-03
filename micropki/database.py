@@ -3,7 +3,7 @@
 
 Содержит:
 - инициализацию БД и создание схемы
-- миграции схемы
+- миграции схемы (v1, v2, v3)
 - получение подключения
 """
 
@@ -13,10 +13,8 @@ from pathlib import Path
 
 logger = logging.getLogger("micropki")
 
-# Текущая версия схемы
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
-# Схема версии 1
 SCHEMA_V1_SQL = """\
 CREATE TABLE IF NOT EXISTS certificates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,7 +35,6 @@ CREATE INDEX IF NOT EXISTS idx_status ON certificates(status);
 CREATE INDEX IF NOT EXISTS idx_subject ON certificates(subject);
 """
 
-# Миграция с версии 1 на версию 2
 MIGRATION_V1_TO_V2_SQL = """\
 CREATE TABLE IF NOT EXISTS crl_metadata (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,6 +48,21 @@ CREATE TABLE IF NOT EXISTS crl_metadata (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ca_subject ON crl_metadata(ca_subject);
 """
 
+# DB-10: таблица compromised_keys
+MIGRATION_V2_TO_V3_SQL = """\
+CREATE TABLE IF NOT EXISTS compromised_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    public_key_hash TEXT UNIQUE NOT NULL,
+    certificate_serial TEXT NOT NULL,
+    compromise_date TEXT NOT NULL,
+    compromise_reason TEXT NOT NULL,
+    FOREIGN KEY (certificate_serial) REFERENCES certificates(serial_hex)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_compromised_key_hash
+ON compromised_keys(public_key_hash);
+"""
+
 SCHEMA_VERSION_TABLE_SQL = """\
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
@@ -58,13 +70,8 @@ CREATE TABLE IF NOT EXISTS schema_version (
 """
 
 
-def get_connection(db_path: str | Path) -> sqlite3.Connection:
-    """
-    Открывает подключение к SQLite.
-
-    :param db_path: путь к файлу БД
-    :return: объект подключения
-    """
+def get_connection(db_path) -> sqlite3.Connection:
+    """Открывает подключение к SQLite."""
     db_path = str(db_path)
     conn = sqlite3.Connection(db_path)
     conn.row_factory = sqlite3.Row
@@ -74,39 +81,31 @@ def get_connection(db_path: str | Path) -> sqlite3.Connection:
 
 
 def _get_schema_version(conn: sqlite3.Connection) -> int:
-    """
-    Получает текущую версию схемы из БД.
-
-    :return: номер версии или 0 если таблица не существует
-    """
     cursor = conn.cursor()
     cursor.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
     )
     if cursor.fetchone() is None:
         return 0
-
     cursor.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1")
     row = cursor.fetchone()
     return row["version"] if row else 0
 
 
 def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
-    """Устанавливает версию схемы."""
     conn.executescript(SCHEMA_VERSION_TABLE_SQL)
     conn.execute("DELETE FROM schema_version")
     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
 
 
-def init_database(db_path: str | Path) -> None:
+def init_database(db_path) -> None:
     """
     Инициализирует БД: создаёт таблицы и выполняет миграции.
 
-    Операция идемпотентна. При повторном запуске:
-    - Если схема актуальна — ничего не делает
-    - Если схема устарела — выполняет миграцию
-
-    :param db_path: путь к файлу БД
+    Версии:
+    - v1: таблица certificates
+    - v2: таблица crl_metadata
+    - v3: таблица compromised_keys (DB-10)
     """
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -122,21 +121,23 @@ def init_database(db_path: str | Path) -> None:
             )
             return
 
-        # Версия 0 → 1: создаём базовую схему
         if current_version < 1:
             logger.info("Создание схемы версии 1...")
             conn.executescript(SCHEMA_V1_SQL)
             _set_schema_version(conn, 1)
             current_version = 1
-            logger.info("Схема версии 1 создана")
 
-        # Версия 1 → 2: добавляем таблицу crl_metadata
         if current_version < 2:
             logger.info("Миграция схемы: версия 1 → 2...")
             conn.executescript(MIGRATION_V1_TO_V2_SQL)
             _set_schema_version(conn, 2)
             current_version = 2
-            logger.info("Миграция на версию 2 завершена (добавлена таблица crl_metadata)")
+
+        if current_version < 3:
+            logger.info("Миграция схемы: версия 2 → 3 (compromised_keys)...")
+            conn.executescript(MIGRATION_V2_TO_V3_SQL)
+            _set_schema_version(conn, 3)
+            current_version = 3
 
         conn.commit()
         logger.info(
@@ -151,12 +152,8 @@ def init_database(db_path: str | Path) -> None:
         conn.close()
 
 
-def check_schema(db_path: str | Path) -> bool:
-    """
-    Проверяет, что схема БД инициализирована.
-
-    :return: True если таблица certificates существует
-    """
+def check_schema(db_path) -> bool:
+    """Проверяет, что схема БД инициализирована."""
     db_path = Path(db_path)
     if not db_path.exists():
         return False

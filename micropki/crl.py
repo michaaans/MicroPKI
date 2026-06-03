@@ -325,4 +325,14 @@ def generate_crl(
         next_update.strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
 
+    # Аудит (AUD-4)
+    from micropki.audit import get_audit_logger
+    audit = get_audit_logger()
+    if audit:
+        audit.log_crl_generation(
+            ca_name=ca_name,
+            crl_number=new_number,
+            revoked_count=len(revoked_for_ca),
+        )
+
     return crl_path
