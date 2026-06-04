@@ -9,6 +9,23 @@
 - cryptography >= 46.0.0
 - pytest >= 7.0
 
+## Архитектура
+
+```mermaid
+graph TD
+    CLI[MicroPKI CLI] --> CA[CA Controller]
+    CLI --> Client[Client Automation]
+    CLI --> Repo[Repository Server]
+    CLI --> OCSP[OCSP Responder]
+    
+    CA --> Policy[Policy Engine]
+    CA --> Audit[Audit & Hash Chain Logger]
+    CA --> DB[(SQLite Registry)]
+    
+    Repo --> DB
+    OCSP --> DB
+```
+
 ## Установка
 
 ```bash
@@ -39,6 +56,23 @@ pytest
 # или
 
 pytest tests/ -v
+```
+
+Запуск с отчётом о покрытии
+```bash
+# Установить pytest-cov
+pip install pytest-cov
+
+# Запустить с покрытием
+pytest tests/ -v --cov=micropki --cov-report=term-missing
+
+# HTML-отчёт
+pytest tests/ --cov=micropki --cov-report=html
+# Открыть: htmlcov/index.html
+
+
+# По умолчанию тесты производительности пропускаются. Для запуска:
+pytest tests/test_sprint8.py -m perf -v -s
 ```
 
 ## Использование
@@ -519,6 +553,131 @@ micropki ocsp serve \
     --rate-limit 10 \
     --rate-burst 20 \
 #    ... (остальные параметры)
+```
+
+## TLS-демонстрация
+
+### Подготовка
+
+```bash
+# Выпустить серверный сертификат
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template server \
+    --subject "CN=localhost" \
+    --san dns:localhost \
+    --san ip:127.0.0.1 \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+```
+
+```bash
+# Создать цепочку CA
+cat pki/certs/intermediate.cert.pem pki/certs/ca.cert.pem > pki/certs/ca-chain.pem
+```
+
+### Запуск TLS-сервера
+
+```bash
+# Терминал 1: Запустить TLS-сервер
+openssl s_server \
+    -cert pki/certs/localhost.cert.pem \
+    -key pki/certs/localhost.key.pem \
+    -CAfile pki/certs/ca.cert.pem \
+    -chainCAfile pki/certs/ca-chain.pem \
+    -accept 8443 \
+    -www
+```
+
+### Подключение клиента
+```bash
+# Терминал 2: Подключиться с доверием к нашему корневому CA
+openssl s_client \
+    -connect localhost:8443 \
+    -CAfile pki/certs/ca.cert.pem \
+    -verify_return_error \
+    -brief
+
+# Ожидаемый вывод:
+# CONNECTION ESTABLISHED
+# Protocol version: TLSv1.3
+# Verification: OK
+```
+
+### Демонстрация отзыва (TLS-3)
+```bash
+# 1. Найти серийный номер сертификата
+micropki ca list-certs --format json
+
+# 2. Отозвать сертификат
+micropki ca revoke <СЕРИЙНЫЙ_НОМЕР> --reason keyCompromise --force
+
+# 3. Обновить CRL
+micropki ca gen-crl \
+    --ca intermediate \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass
+
+# 4. Проверить что отозванный сертификат отклоняется
+openssl verify \
+    -CAfile pki/certs/ca.cert.pem \
+    -untrusted pki/certs/intermediate.cert.pem \
+    -crl_check \
+    -CRLfile pki/crl/intermediate.crl.pem \
+    pki/certs/localhost.cert.pem
+
+# Ожидаемый вывод:
+# error 23 at 0 depth lookup: certificate revoked
+```
+
+### Подпись кода
+Выпуск сертификата подписи кода
+```bash
+micropki ca issue-cert \
+    --ca-cert pki/certs/intermediate.cert.pem \
+    --ca-key pki/private/intermediate.key.pem \
+    --ca-pass-file secrets/intermediate.pass \
+    --template code_signing \
+    --subject "CN=My Code Signer" \
+    --out-dir pki/certs \
+    --db-path pki/micropki.db
+```
+
+### Подписание файла
+```bash
+# Подписать файл
+openssl dgst -sha256 \
+    -sign pki/certs/My_Code_Signer.key.pem \
+    -out myscript.py.sig \
+    myscript.py
+
+# Ожидаемый результат: файл myscript.py.sig создан
+```
+
+### Верификация подписи
+```bash
+# Извлечь открытый ключ
+openssl x509 -in pki/certs/My_Code_Signer.cert.pem -pubkey -noout > /tmp/pub.pem
+
+# Верифицировать
+openssl dgst -sha256 \
+    -verify /tmp/pub.pem \
+    -signature myscript.py.sig \
+    myscript.py
+
+# Ожидаемый вывод: Verified OK
+
+# Проверить что изменённый файл не проходит верификацию
+echo "# tampered" >> myscript.py
+openssl dgst -sha256 \
+    -verify /tmp/pub.pem \
+    -signature myscript.py.sig \
+    myscript.py
+
+# Ожидаемый вывод: Verification Failure
 ```
 
 ## Тестирование
@@ -2483,6 +2642,46 @@ bash tests/test_integration_sprint7.sh
 #  PASS: Инициализация БД
 #2026-06-03T18:05:38 INFO Чтение парольной фразы из файла
 ```
+
+## Аспекты безопасности
+
+> **Важно:** MicroPKI является учебным проектом и **не предназначен для использования в production** без дополнительного усиления защиты.
+
+### Известные ограничения и риски
+
+**Хранение ключей:**
+- Закрытые ключи конечных субъектов (серверные, клиентские, code signing) хранятся **незашифрованными** на диске. Это сделано для упрощения автоматизации, но в production каждый ключ должен быть защищён парольной фразой или HSM.
+- Ключи корневого и промежуточного CA зашифрованы парольными фразами, однако сами парольные фразы хранятся в файлах `secrets/`. В production эти файлы должны иметь права `0o400` и храниться в защищённом хранилище секретов (Vault, HSM и т.п.).
+
+**Транспортная безопасность:**
+- Сервер репозитория (`repo serve`) и OCSP-ответчик (`ocsp serve`) работают по **HTTP без TLS**. Это допустимо в учебной среде, но в production необходим HTTPS (например, через обратный прокси nginx/Caddy).
+- Без TLS данные (сертификаты, CRL, OCSP-ответы) передаются в открытом виде и уязвимы для MITM-атак.
+
+**Аутентификация API:**
+- Эндпоинт `POST /request-cert` защищён простым API-ключом через заголовок `X-API-Key`. Если переменная окружения `MICROPKI_API_KEY` не задана, аутентификация **отключена**. Это небезопасно для production.
+- Рекомендация: всегда задавать `MICROPKI_API_KEY` и использовать TLS для защиты транспорта.
+
+**Ограничение скорости:**
+- Rate limiting реализован через алгоритм token bucket на стороне приложения. Он не защищает от **распределённых атак** (DDoS) с множества IP-адресов. Для production необходим внешний rate limiter (nginx, WAF, CDN).
+
+**Целостность журнала аудита:**
+- Целостность обеспечивается SHA-256 хеш-цепочкой. Сам файл журнала **не подписан** криптографически — злоумышленник с доступом к файловой системе может пересчитать хеши после модификации. В production журналы должны отправляться в защищённую внешнюю систему (SIEM, append-only storage).
+
+**Certificate Transparency:**
+- CT-журнал в MicroPKI является **симуляцией**. Не используется дерево Меркла, нет cryptographic proof of inclusion, нет обмена с публичными CT-серверами. Реальная CT требует реализации RFC 6962.
+
+**Алгоритмы:**
+- Используются RSA-2048/4096 и ECC P-256/P-384 с SHA-256/SHA-384. Это соответствует современным стандартам. SHA-1 явно запрещён политиками системы.
+- В учебных целях корневой CA может быть создан с RSA-4096, что является хорошей практикой.
+
+**Рекомендации для production-использования:**
+1. Использовать HSM для хранения ключей корневого и промежуточного CA.
+2. Держать корневой CA в offline-режиме.
+3. Включить TLS для всех HTTP-сервисов.
+4. Настроить внешнее хранение журналов аудита.
+5. Реализовать реальный CT-журнал или интеграцию с публичными CT-серверами.
+6. Добавить многофакторную аутентификацию для административных операций.
+
 
 ## Структура выходных файлов
 ```text

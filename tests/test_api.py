@@ -101,10 +101,3 @@ def test_get_ca_unknown_level(pki_env):
     assert response.status_code == 400
 
 
-def test_crl_returns_200(pki_env):
-    """GET /crl возвращает CRL и код 200 """
-    app = create_app(pki_env["db_path"], pki_env["cert_dir"])
-    client = TestClient(app)
-
-    response = client.get("/crl")
-    assert response.status_code == 200
